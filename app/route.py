@@ -108,6 +108,12 @@ class Data:
             if nodeid == LAZY_LOAD_TEST:
                 self.lazy_load = 1 << i
         self._open_values()
+        attrs_path = os.path.join(root, "attrs.json")
+        self.attr_read: dict[str, int] = {}
+        self.attr_import: set[str] = set()
+        if os.path.exists(attrs_path):
+            attrs = json.loads(load("attrs.json"))
+            self.attr_read, self.attr_import = attrs["read"], set(attrs["import"])
 
     def bits(self, sid: int) -> int:
         offset = sid * self.width
@@ -156,6 +162,14 @@ class Data:
         sid = self.module_users.get(path)
         return 0 if sid is None else self.bits(sid)
 
+    def attr_readers(self, owner: str, name: str) -> int | None:
+        """Tests that read owner.NAME at runtime (resolved to owner), or None when it is also read at
+        import time (it feeds derived state) or no runtime read was ever recorded."""
+        key = f"{owner}|{name}"
+        if key in self.attr_import or key not in self.attr_read:
+            return None
+        return self.bits(self.attr_read[key])
+
     # ----- recorded comparison states (see infect.py) -----
     def has_values(self, path: str) -> bool:
         return self._values is not None and path in self._value_names
@@ -189,9 +203,14 @@ class Router:
         if not files:
             raise Everything("patch names no files")
         self._units, self._candidate = 0, None
+        self.behavioral_files: set[str] = set()  # files whose change can alter behavior
+        self.patched: dict[str, str] = {}  # python path -> patched text
         bits = 0
         for file_patch in files:
+            before_units = self._units
             bits |= self.route_file(file_patch, notes)
+            if self._units > before_units:
+                self.behavioral_files.add(file_patch.path)
         # Recorded states describe the pinned program. They stay valid only when the comparison is
         # the patch's one behavioral change, so pruning is applied in that case alone.
         if self._units == 1 and self._candidate:
@@ -286,6 +305,7 @@ class Router:
             after, blocks = apply(before, fp.hunks)
         except PatchError as error:
             raise Everything(f"{path}: {error}")
+        self.patched[path] = after
         if not blocks:
             return 0
         s = self.data.structure(path)
@@ -391,6 +411,10 @@ class Router:
                 return 0
         except (SyntaxError, ValueError):
             pass
+        field = self._field_route(path, s, first, last, old_tree, new_tree, notes)
+        if field is not None:
+            self._units += 1
+            return field
         self._units += 1
         bits = 0
         runtime_only = True
@@ -409,6 +433,41 @@ class Router:
                 offset = first - (2 if wrapped else 1)
                 self._candidate = self._proven(path, pairs, offset, notes)
         return bits
+
+    @staticmethod
+    def _single_target(tree) -> tuple[str, ast.AST] | None:
+        body = tree.body
+        if len(body) == 1 and isinstance(body[0], ast.If) and isinstance(body[0].test, ast.Constant):
+            body = body[0].body  # the "if 1:" wrapper of an indented snippet
+        if len(body) != 1:
+            return None
+        node = body[0]
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            return node.targets[0].id, node
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            return node.target.id, node
+        return None
+
+    def _field_route(self, path, s, first, last, old_tree, new_tree, notes) -> int | None:
+        """A change confined to one class-body `NAME = value` reaches only tests that read that
+        attribute at runtime, resolved to this class (not a subclass override)."""
+        if not path.startswith("sqlglot/") or not self.data.attr_read:
+            return None
+        index = s.common(first, last)
+        if index == -1 or s.stmts[index][3] != "simple" or s.span(index) != (first, last):
+            return None
+        parent = s.stmts[index][2]
+        if parent == -1 or s.stmts[parent][3] != "class":
+            return None
+        old, new = self._single_target(old_tree), self._single_target(new_tree)
+        if old is None or new is None or old[0] != new[0]:
+            return None
+        name, qualname = old[0], s.stmts[parent][6]
+        readers = self.data.attr_readers(f"{_module_name(path)}:{qualname}", name)
+        if readers is None:
+            return None
+        notes.append(f"{path}:{first} field {qualname}.{name} read by {bin(readers).count('1')}")
+        return readers | self.data.lazy_load
 
     def _proven(self, path: str, pairs, offset: int, notes: list[str]) -> int:
         """Tests whose every recorded state gives the same outcome for every changed comparison."""

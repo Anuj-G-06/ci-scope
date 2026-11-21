@@ -1,12 +1,13 @@
 {
  "sqlglot_commit": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
  "tests": 1621,
- "distinct_sets": 33884,
+ "distinct_sets": 35002,
  "set_width_bytes": 203,
  "line_files": 250,
  "snapshot_files": 253,
  "class_names": 1224,
  "read_files": 290,
  "value_sites": 1847,
- "value_entries": 130894
+ "value_entries": 130894,
+ "attr_keys": 2497
 }

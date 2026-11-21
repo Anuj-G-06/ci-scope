@@ -48,6 +48,8 @@ def main() -> int:
     number_by_id = {t["id"]: t["number"] for t in tests}
 
     router = None
+    stand_in = None
+    suite_numbers: dict[str, set[int]] = {}
     index_to_number: list[int | None] = []
     unmapped: set[int] = set()
     try:
@@ -55,6 +57,16 @@ def main() -> int:
         router = Router(data)
         index_to_number = [number_by_id.get(nodeid) for nodeid in data.tests]
         unmapped = every - {n for n in index_to_number if n is not None}
+        try:
+            import standin
+
+            if os.path.exists(os.path.join(MAPS, "proxy_baseline.json")):
+                stand_in = standin.StandIn(MAPS, data._source)
+                suite_numbers = {
+                    suite: {number_by_id[t] for t in tests if t in number_by_id} for suite, tests in standin.SUITES.items()
+                }
+        except Exception as error:  # noqa: BLE001
+            log(f"stand-in unavailable ({error!r})")
         if unmapped:
             log(f"{len(unmapped)} tests have no map data; they join every non-empty selection")
     except Exception as error:  # noqa: BLE001 - any failure here must degrade to "run everything"
@@ -77,6 +89,24 @@ def main() -> int:
             if numbers and unmapped:
                 numbers |= unmapped
             level = "mapped"
+            if stand_in is not None and any(numbers & tests for tests in suite_numbers.values()):
+                import standin
+
+                if standin.eligible(router.behavioral_files):
+                    current = schedule.cost(schedule.split(numbers, durations), durations)
+                    worth = [
+                        suite for suite, tests in suite_numbers.items()
+                        if numbers & tests and current - schedule.cost(schedule.split(numbers - tests, durations), durations)
+                        > standin.CPU_COST_MS[suite]
+                    ]
+                    same = stand_in.unchanged_suites(router.patched, log, worth) if worth else set()
+                    for suite in same:
+                        dropped = numbers & suite_numbers[suite]
+                        if dropped:
+                            numbers -= dropped
+                            notes.append(f"stand-in: {suite} unchanged, dropped {len(dropped)}")
+                    if worth and not same:
+                        notes.append(f"stand-in: {','.join(worth)} digests differ, tests kept")
         except Everything as reason:
             numbers, level = set(every), f"everything: {reason}"
         except Exception as error:  # noqa: BLE001
