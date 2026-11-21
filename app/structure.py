@@ -140,6 +140,12 @@ class Structure:
         """Lines whose execution means the statement holding `line` ran: a simple statement's whole
         span, a compound statement's header, or a whole compound for else:/except:/finally: lines."""
         index = self.innermost(line)
+        # A line inside a lambda body runs only when the lambda is called: its region is the body, not
+        # the enclosing statement (often a class-level dict whose other lines run at import).
+        lam = self.innermost_lambda(line)
+        if lam is not None and (index == -1 or lam[0] >= self.stmts[index][0]):
+            lambda_line, body_first, body_last = lam
+            return max(body_first, lambda_line + 1), body_last
         if index == -1:
             return line, line
         start, end, _parent, kind, body_start, _def_line, _name = self.stmts[index]
@@ -148,6 +154,16 @@ class Structure:
         if body_start and line < body_start:
             return start, body_start - 1
         return start, end
+
+    def innermost_lambda(self, line: int):
+        """(lambda line, body first line, body last line) of the innermost lambda whose body holds
+        `line` on a line after the lambda keyword, or None."""
+        best = None
+        for lambda_line, body_first, body_last in self.lambdas:
+            if body_first <= line <= body_last and line > lambda_line:
+                if best is None or lambda_line >= best[0]:
+                    best = (lambda_line, body_first, body_last)
+        return best
 
     # ----- when a line runs -----
     def kind(self, line: int) -> str:

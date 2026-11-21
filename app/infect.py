@@ -18,7 +18,6 @@ Abstract operands, as recorded by the mapping run:
 from __future__ import annotations
 
 import ast
-import hashlib
 
 
 class Unknown(Exception):
@@ -78,8 +77,12 @@ def _equal(a, b, same: bool | None) -> bool:
             text = other[-1]
             if len(text) != hashed[1]:
                 return False
+            import hashlib  # rare: only long strings are hashed
+
             return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest() == hashed[2]
         if hashed[0] == "Y" and other[0] == "y":
+            import hashlib
+
             data = bytes.fromhex(other[1])
             return len(data) == hashed[1] and hashlib.sha1(data).hexdigest() == hashed[2]
         raise Unknown("hashed value")
@@ -151,6 +154,21 @@ def _constant_abs(value):
     raise Unknown("constant")
 
 
+def same(a, b) -> bool:
+    """Structural equality of syntax trees, ignoring positions (what ast.dump compares), with an
+    early exit. O(size of the smaller tree), versus ast.dump's string building."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for field in a._fields:
+            if not same(getattr(a, field, None), getattr(b, field, None)):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def core(node: ast.AST) -> ast.Compare | None:
     """The single binary comparison at the heart of a comparison expression (maybe under `not`)."""
     while isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -162,10 +180,9 @@ def core(node: ast.AST) -> ast.Compare | None:
 
 def _operand(node: ast.AST, site: ast.Compare, left, right):
     """Abstract value of an operand of the new comparison: the site's left or right, or a constant."""
-    dumped = ast.dump(node)
-    if dumped == ast.dump(site.left):
+    if same(node, site.left):
         return "L", left
-    if dumped == ast.dump(site.comparators[0]):
+    if same(node, site.comparators[0]):
         return "R", right
     if isinstance(node, ast.Constant):
         return "C", _constant_abs(node.value)
@@ -215,19 +232,15 @@ def changed_comparisons(old: ast.AST, new: ast.AST) -> list[tuple[ast.AST, ast.A
 
     def walk(a, b) -> bool:
         if isinstance(a, ast.AST) and isinstance(b, ast.AST):
-            if ast.dump(a) == ast.dump(b):
-                return True
             if core(a) is not None and core(b) is not None:
-                pairs.append((a, b))
+                if not same(a, b):
+                    pairs.append((a, b))
                 return True
             if type(a) is not type(b):
                 return False
-            for field in a._fields:
-                if not walk(getattr(a, field, None), getattr(b, field, None)):
-                    return False
-            return True
+            return all(walk(getattr(a, field, None), getattr(b, field, None)) for field in a._fields)
         if isinstance(a, list) and isinstance(b, list):
             return len(a) == len(b) and all(walk(x, y) for x, y in zip(a, b))
-        return a == b
+        return type(a) is type(b) and a == b
 
     return pairs if walk(old, new) and pairs else None

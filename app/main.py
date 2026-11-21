@@ -15,13 +15,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from pathlib import Path  # noqa: E402
-
 import schedule  # noqa: E402
 from route import Data, Everything, Router  # noqa: E402
 
-INPUT = Path(os.environ.get("SHRAPNEL_INPUT", "/data"))
-MAPS = Path(os.environ.get("SHRAPNEL_MAPS", os.path.join(HERE, "data")))
+INPUT = os.environ.get("SHRAPNEL_INPUT", "/data")
+MAPS = os.environ.get("SHRAPNEL_MAPS", os.path.join(HERE, "data"))
 
 
 def log(message: str) -> None:
@@ -43,7 +41,8 @@ def bits_to_numbers(bits: int, index_to_number: list[int | None]) -> set[int]:
 
 def main() -> int:
     started = time.process_time()
-    tests = json.loads((INPUT / "tests.json").read_text("utf-8"))["tests"]
+    with open(os.path.join(INPUT, "tests.json"), "rb") as file:
+        tests = json.loads(file.read())["tests"]
     durations = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     every = set(durations)
     number_by_id = {t["id"]: t["number"] for t in tests}
@@ -62,13 +61,18 @@ def main() -> int:
         log(f"maps unavailable ({error!r}); every commit runs every test")
 
     lines = []
-    for patch_path in sorted((INPUT / "commits").glob("*.patch")):
-        commit = patch_path.name[: -len(".patch")]
+    commits_dir = os.path.join(INPUT, "commits")
+    for name in sorted(os.listdir(commits_dir)):
+        if not name.endswith(".patch"):
+            continue
+        patch_path = os.path.join(commits_dir, name)
+        commit = name[: -len(".patch")]
         notes: list[str] = []
         try:
             if router is None:
                 raise Everything("no maps")
-            text = patch_path.read_bytes().decode("utf-8", errors="surrogateescape")
+            with open(patch_path, "rb") as file:
+                text = file.read().decode("utf-8", errors="surrogateescape")
             numbers = bits_to_numbers(router.route(text, notes), index_to_number)
             if numbers and unmapped:
                 numbers |= unmapped

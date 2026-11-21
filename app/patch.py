@@ -7,7 +7,6 @@ raises PatchError, and the caller then runs every test for that commit rather th
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -16,37 +15,40 @@ class PatchError(Exception):
     pass
 
 
-@dataclass
 class Hunk:
-    old_start: int
-    old_count: int
-    new_start: int
-    new_count: int
-    lines: list[str] = field(default_factory=list)
+    __slots__ = ("old_start", "old_count", "new_start", "new_count", "lines")
+
+    def __init__(self, old_start: int, old_count: int, new_start: int, new_count: int):
+        self.old_start, self.old_count, self.new_start, self.new_count = old_start, old_count, new_start, new_count
+        self.lines: list[str] = []
 
 
-@dataclass
 class FilePatch:
-    old_path: str | None  # None for a new file
-    new_path: str | None  # None for a deleted file
-    hunks: list[Hunk] = field(default_factory=list)
-    binary: bool = False
-    renamed: bool = False
+    __slots__ = ("old_path", "new_path", "hunks", "binary", "renamed")
+
+    def __init__(self, old_path: str | None, new_path: str | None):
+        self.old_path = old_path  # None for a new file
+        self.new_path = new_path  # None for a deleted file
+        self.hunks: list[Hunk] = []
+        self.binary = False
+        self.renamed = False
 
     @property
     def path(self) -> str:
         return self.new_path or self.old_path or ""
 
 
-@dataclass
 class Block:
     """One contiguous change. Lines are numbered in the old file. A pure insertion has no removed
     lines and sits after old line `after` (0 means before the first line)."""
 
-    first: int  # first removed old line, or after + 1 for an insertion
-    removed: list[str]
-    added: list[str]
-    after: int  # the old line the change follows
+    __slots__ = ("first", "removed", "added", "after")
+
+    def __init__(self, first: int, removed: list[str], added: list[str], after: int):
+        self.first = first  # first removed old line, or after + 1 for an insertion
+        self.removed = removed
+        self.added = added
+        self.after = after  # the old line the change follows
 
     @property
     def last(self) -> int:

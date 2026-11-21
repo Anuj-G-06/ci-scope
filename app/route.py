@@ -9,11 +9,11 @@ from __future__ import annotations
 import ast
 import json
 import posixpath
+import os
 import re
-import zipfile
-from pathlib import Path
 
 import infect
+from pack import Pack
 from patch import Block, FilePatch, PatchError, apply, parse, splice
 from structure import Structure
 
@@ -28,6 +28,7 @@ INERT_FILES = {
 INERT_PREFIXES = ("posts/", ".github/", "benchmarks/", "pdoc/")
 CONFIG_FILES = {"pyproject.toml": ("tool.ruff",), "setup.cfg": ("mypy",)}
 PYTEST_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
+LAZY_LOAD_TEST = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 
 
 class Everything(Exception):
@@ -74,30 +75,38 @@ def _same_code(a, b) -> bool:
 class Data:
     """Runtime maps. Everything is loaded lazily per touched file and cached for the batch."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: str):
         self.root = root
-        self.tests: list[str] = json.loads((root / "tests.json").read_text("utf-8"))
-        meta = json.loads((root / "meta.json").read_text("utf-8"))
+
+        def load(name):
+            with open(os.path.join(root, name), "rb") as file:
+                return file.read()
+
+        self.tests: list[str] = json.loads(load("tests.json"))
+        meta = json.loads(load("meta.json"))
         self.width: int = meta["set_width_bytes"]
-        self.sets = (root / "sets.bin").read_bytes()
-        users = json.loads((root / "users.json").read_text("utf-8"))
+        self.sets = load("sets.bin")
+        users = json.loads(load("users.json"))
         self.class_users: dict[str, int] = users["class"]
         self.file_readers: dict[str, int] = users["file"]
         self.module_users: dict[str, int] = users["module"]
         self.import_lines: dict[str, list[int]] = users.get("import_lines", {})
-        self.repo_files = set(json.loads((root / "repo_files.json").read_text("utf-8")))
-        self._lines = zipfile.ZipFile(root / "lines.zip")
-        self._source = zipfile.ZipFile(root / "source.zip")
-        self._structure = zipfile.ZipFile(root / "structure.zip")
-        self._line_names = set(self._lines.namelist())
-        self._source_names = set(self._source.namelist())
+        self.repo_files = set(json.loads(load("repo_files.json")))
+        self._lines = Pack(os.path.join(root, "lines.pack"))
+        self._source = Pack(os.path.join(root, "source.pack"))
+        self._structure = Pack(os.path.join(root, "structure.pack"))
+        self._line_names = self._lines.index
+        self._source_names = self._source.index
         self._cache_lines: dict[str, dict[int, int]] = {}
         self._cache_source: dict[str, str] = {}
         self._cache_structure: dict[str, Structure] = {}
         self.by_file: dict[str, int] = {}
+        self.lazy_load = 0  # this test runs `import sqlglot` in a subprocess that no map can see
         for i, nodeid in enumerate(self.tests):
             file = nodeid.split("::", 1)[0]
             self.by_file[file] = self.by_file.get(file, 0) | (1 << i)
+            if nodeid == LAZY_LOAD_TEST:
+                self.lazy_load = 1 << i
         self._open_values()
 
     def bits(self, sid: int) -> int:
@@ -158,9 +167,9 @@ class Data:
         return found["sites"].get(site), found["overflow"].get(site)
 
     def _open_values(self) -> None:
-        target = self.root / "values.zip"
-        self._values = zipfile.ZipFile(target) if target.exists() else None
-        self._value_names = set(self._values.namelist()) if self._values is not None else set()
+        target = os.path.join(self.root, "values.pack")
+        self._values = Pack(target) if os.path.exists(target) else None
+        self._value_names = self._values.index if self._values is not None else {}
         self._cache_values: dict[str, dict] = {}
 
 
@@ -361,7 +370,7 @@ class Router:
             new_tree = ast.parse(_snippet(new_text))
         except SyntaxError:
             return self._route_whole_file(path, s, before, after, group, notes)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if infect.same(old_tree, new_tree):
             notes.append(f"{path}:{first}-{last} same syntax tree")
             return 0
         # Compile in the real function context, so return/yield/break/nonlocal are checked.
@@ -454,6 +463,8 @@ class Router:
             bits |= got
         if kind in ("import", "both"):
             bits |= self._import_users(path, s, line, notes)
+        if path.startswith("sqlglot/") and (kind != "runtime" or line in self._import_lines(path)):
+            bits |= self.data.lazy_load  # code that runs during `import sqlglot`
         return bits
 
     def _import_lines(self, path: str) -> set[int]:
@@ -511,7 +522,7 @@ class Router:
         if path.startswith("tests/"):
             raise Everything(f"{path}: module-level change in a test module")
         self._units += 1
-        users = self.data.users_of_module(path)
+        users = self.data.users_of_module(path) | self.data.lazy_load
         notes.append(f"{path}: module-level change -> module users {bin(users).count('1')}")
         return users
 
@@ -525,7 +536,7 @@ class Router:
             compile(after, path, "exec")
         except (SyntaxError, ValueError):
             raise Everything(f"{path}: patched file does not compile")
-        if ast.dump(ast.parse(before)) == ast.dump(new_tree):
+        if infect.same(ast.parse(before), new_tree):
             notes.append(f"{path}: same syntax tree (whole file)")
             return 0
         self._units += 1
