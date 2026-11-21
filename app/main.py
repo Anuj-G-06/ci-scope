@@ -1,0 +1,93 @@
+"""shrapnel: pick the sqlglot tests a patch can hit, split them across workers, print one JSON line
+per commit. stdout carries answers only; every log line goes to stderr.
+
+Fails safe: if the maps cannot load, or a commit raises anything unexpected, that commit runs every
+test, which can cost seconds but can never miss or reject the run.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from pathlib import Path  # noqa: E402
+
+import schedule  # noqa: E402
+from route import Data, Everything, Router  # noqa: E402
+
+INPUT = Path(os.environ.get("SHRAPNEL_INPUT", "/data"))
+MAPS = Path(os.environ.get("SHRAPNEL_MAPS", os.path.join(HERE, "data")))
+
+
+def log(message: str) -> None:
+    sys.stderr.write(message + "\n")
+
+
+def bits_to_numbers(bits: int, index_to_number: list[int | None]) -> set[int]:
+    numbers = set()
+    while bits:
+        low = bits & -bits
+        i = low.bit_length() - 1
+        bits ^= low
+        if i < len(index_to_number):
+            number = index_to_number[i]
+            if number is not None:
+                numbers.add(number)
+    return numbers
+
+
+def main() -> int:
+    started = time.process_time()
+    tests = json.loads((INPUT / "tests.json").read_text("utf-8"))["tests"]
+    durations = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
+    every = set(durations)
+    number_by_id = {t["id"]: t["number"] for t in tests}
+
+    router = None
+    index_to_number: list[int | None] = []
+    unmapped: set[int] = set()
+    try:
+        data = Data(MAPS)
+        router = Router(data)
+        index_to_number = [number_by_id.get(nodeid) for nodeid in data.tests]
+        unmapped = every - {n for n in index_to_number if n is not None}
+        if unmapped:
+            log(f"{len(unmapped)} tests have no map data; they join every non-empty selection")
+    except Exception as error:  # noqa: BLE001 - any failure here must degrade to "run everything"
+        log(f"maps unavailable ({error!r}); every commit runs every test")
+
+    lines = []
+    for patch_path in sorted((INPUT / "commits").glob("*.patch")):
+        commit = patch_path.name[: -len(".patch")]
+        notes: list[str] = []
+        try:
+            if router is None:
+                raise Everything("no maps")
+            text = patch_path.read_bytes().decode("utf-8", errors="surrogateescape")
+            numbers = bits_to_numbers(router.route(text, notes), index_to_number)
+            if numbers and unmapped:
+                numbers |= unmapped
+            level = "mapped"
+        except Everything as reason:
+            numbers, level = set(every), f"everything: {reason}"
+        except Exception as error:  # noqa: BLE001
+            numbers, level = set(every), f"everything: internal error {error!r}"
+        numbers &= every
+        workers = schedule.split(numbers, durations)
+        lines.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
+        log(f"{commit}: {len(numbers)} tests, {len(workers)} workers, "
+            f"{schedule.cost(workers, durations) / 1000:.3f} s ({level}) | {'; '.join(notes)[:300]}")
+
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
+    log(f"done: {len(lines)} commits, {time.process_time() - started:.3f} s CPU in the selector")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
