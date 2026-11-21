@@ -30,6 +30,53 @@ CONFIG_FILES = {"pyproject.toml": ("tool.ruff",), "setup.cfg": ("mypy",)}
 PYTEST_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
 LAZY_LOAD_TEST = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 
+# Every TestExecutor test reads both TPC fixtures (setUpClass loads them), but each test uses only some
+# fields of the loaded (meta, sql, expected) pairs. The others need nothing but a loader that succeeds.
+TPC_FIXTURES = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": (
+        ("tests/test_optimizer.py::TestOptimizer::test_tpcds", (0, 1, 2)),  # check_file: all of it
+        ("tests/test_executor.py::TestExecutor::test_execute_tpcds", (0, 1)),  # (meta, sql, _)
+    ),
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql": (
+        ("tests/test_optimizer.py::TestOptimizer::test_tpch", (0, 1, 2)),
+        ("tests/test_executor.py::TestExecutor::test_execute_tpch", (0, 1)),
+        ("tests/test_executor.py::TestExecutor::test_optimized_tpch", (1, 2)),  # (_, sql, optimized)
+    ),
+}
+FIXTURE_LOADER = "tests/helpers.py"
+
+
+def _filter_comments(s):
+    """tests/helpers.py, verbatim."""
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def _extract_meta(sql):
+    """tests/helpers.py, verbatim (it raises on a '#' line without ':' and on a block of only '#' lines)."""
+    meta = {}
+    sql_lines = sql.split("\n")
+    i = 0
+    while sql_lines[i].startswith("#"):
+        key, val = sql_lines[i].split(":", maxsplit=1)
+        meta[key.lstrip("#").strip()] = val.strip()
+        i += 1
+    sql = "\n".join(sql_lines[i:])
+    return sql, meta
+
+
+def fixture_pairs(text: str) -> list:
+    """tests/helpers.py load_sql_fixture_pairs, on the text open(path, encoding="utf-8") returns."""
+    statements = _filter_comments(text.replace("\r\n", "\n").replace("\r", "\n")).split(";")
+    size = len(statements)
+    pairs = []
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = statements[i].strip()
+            sql, meta = _extract_meta(sql)
+            expected = statements[i + 1].strip()
+            pairs.append((meta, sql, expected))
+    return pairs
+
 
 class Everything(Exception):
     """This commit could affect anything we cannot bound: run every test."""
@@ -101,6 +148,7 @@ class Data:
         self._cache_source: dict[str, str] = {}
         self._cache_structure: dict[str, Structure] = {}
         self.by_file: dict[str, int] = {}
+        self._bit_of: dict[str, int] | None = None
         self.lazy_load = 0  # this test runs `import sqlglot` in a subprocess that no map can see
         for i, nodeid in enumerate(self.tests):
             file = nodeid.split("::", 1)[0]
@@ -118,6 +166,11 @@ class Data:
     def bits(self, sid: int) -> int:
         offset = sid * self.width
         return int.from_bytes(self.sets[offset:offset + self.width], "little")
+
+    def bit_of(self, nodeid: str) -> int | None:
+        if self._bit_of is None:
+            self._bit_of = {test: 1 << i for i, test in enumerate(self.tests)}
+        return self._bit_of.get(nodeid)
 
     def has_source(self, path: str) -> bool:
         return path in self._source_names
@@ -203,6 +256,7 @@ class Router:
         if not files:
             raise Everything("patch names no files")
         self._units, self._candidate = 0, None
+        self._paths = {f.path for f in files}
         self.behavioral_files: set[str] = set()  # files whose change can alter behavior
         self.touched: list[tuple[str, int, int, bool]] = []  # (path, first, last, runtime-only) per changed line
         self.patched: dict[str, str] = {}  # python path -> patched text
@@ -288,6 +342,10 @@ class Router:
         sid = self.data.file_readers.get(fp.path)
         if sid is None:
             raise Everything(f"{fp.path}: fixture with no recorded readers")
+        if fp.path in TPC_FIXTURES and FIXTURE_LOADER not in self._paths:
+            found = self._route_tpc_fixture(fp, self.data.bits(sid), notes)
+            if found is not None:
+                return found
         if fp.path.endswith(".sql"):
             changed = [line for hunk in fp.hunks for line in hunk.lines if line[:1] in "+-"]
             # tests/helpers.py drops empty lines and lines starting with "--" before parsing.
@@ -297,6 +355,37 @@ class Router:
         notes.append(f"{fp.path}: fixture -> readers")
         self._units += 1
         return self.data.bits(sid)
+
+    def _route_tpc_fixture(self, fp: FilePatch, readers: int, notes: list[str]) -> int | None:
+        """The readers whose fields of the loaded pairs change. None means every reader."""
+        if not self.data.has_source(fp.path):
+            return None
+        before = self.data.source(fp.path)
+        try:
+            after, _blocks = apply(before, fp.hunks)
+            after.encode("utf-8")  # a lone surrogate: bytes that open(encoding="utf-8") cannot decode
+        except (PatchError, UnicodeError):
+            return None
+        old = fixture_pairs(before)
+        try:
+            new = fixture_pairs(after)
+        except Exception:  # noqa: BLE001 - the loader raises, so setUpClass fails for every reader
+            notes.append(f"{fp.path}: the fixture loader fails")
+            return None
+        bits, names = 0, []
+        for nodeid, fields in TPC_FIXTURES[fp.path]:
+            if len(old) != len(new) or any(
+                tuple(o[k] for k in fields) != tuple(n[k] for k in fields) for o, n in zip(old, new)
+            ):
+                bit = self.data.bit_of(nodeid)
+                if bit is None or not bit & readers:
+                    return None
+                bits |= bit
+                names.append(nodeid.rsplit("::", 1)[1])
+        notes.append(f"{fp.path}: changed pair fields -> {', '.join(names) or 'no test'}")
+        if bits:
+            self._units += 1
+        return bits
 
     # ----- python -----
     def route_python(self, fp: FilePatch, notes: list[str]) -> int:
