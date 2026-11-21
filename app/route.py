@@ -204,6 +204,7 @@ class Router:
             raise Everything("patch names no files")
         self._units, self._candidate = 0, None
         self.behavioral_files: set[str] = set()  # files whose change can alter behavior
+        self.touched: list[tuple[str, int, int, bool]] = []  # (path, first, last, runtime-only) per changed line
         self.patched: dict[str, str] = {}  # python path -> patched text
         bits = 0
         for file_patch in files:
@@ -411,7 +412,12 @@ class Router:
                 return 0
         except (SyntaxError, ValueError):
             pass
-        field = self._field_route(path, s, first, last, old_tree, new_tree, notes)
+        changed = [ln for b in group for ln in ([b.after, b.after + 1] if b.insertion else range(b.first, b.last + 1))]
+        # A changed line inside a function or lambda body runs at call time: its own coverage is
+        # more precise than every reader of the enclosing class attribute.
+        field = None
+        if not any(1 <= ln <= s.lines and s.kind(ln) == "runtime" for ln in changed):
+            field = self._field_route(path, s, first, last, old_tree, new_tree, notes)
         if field is not None:
             self._units += 1
             return field
@@ -463,6 +469,8 @@ class Router:
         if old is None or new is None or old[0] != new[0]:
             return None
         name, qualname = old[0], s.stmts[parent][6]
+        if name in s.class_refs.get(parent, ()):
+            return None  # the class body derives something from it at creation: invisible to the recorder
         readers = self.data.attr_readers(f"{_module_name(path)}:{qualname}", name)
         if readers is None:
             return None
@@ -504,6 +512,11 @@ class Router:
 
     def _route_line(self, path: str, s: Structure, line: int, notes: list[str]) -> int:
         kind = s.kind(line)
+        if kind == "runtime" and line not in self._import_lines(path):
+            first, last = s.coverage_region(line)
+            self.touched.append((path, first, last, True))
+        else:
+            self.touched.append((path, line, line, False))  # runs at import: reaches everything
         bits = 0
         if kind in ("runtime", "both"):
             first, last = s.coverage_region(line)

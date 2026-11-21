@@ -17,8 +17,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# TPC-DS is decided exactly by tpc.py; the digest stand-in keeps the TPC-H tests, which execute nothing
+# (parse, pickle round trip, DuckDB transpiles), so equal digests are an exact verdict for them.
 SUITES = {
-    "tpcds": ("tests/test_executor.py::TestExecutor::test_execute_tpcds",),
     "tpch": ("tests/test_executor.py::TestExecutor::test_execute_tpch",
              "tests/test_executor.py::TestExecutor::test_optimized_tpch"),
 }
@@ -39,11 +40,45 @@ def eligible(paths) -> bool:
     return bool(paths) and all(p.startswith(ELIGIBLE_PREFIXES) and p not in NOT_ELIGIBLE for p in paths)
 
 
+class Workspace:
+    """The pinned sqlglot package in a temp dir; `apply(patched)` writes a patch in, `restore()` undoes it."""
+
+    def __init__(self, source):
+        self.source = source
+        self.root = None
+        self.written: list[str] = []
+
+    def apply(self, patched: dict[str, str]) -> str | None:
+        if self.root is None:
+            root = tempfile.mkdtemp(prefix="shrapnel-")
+            for name in self.source.names():
+                if name.startswith("sqlglot/") and name.endswith(".py"):
+                    target = os.path.join(root, name)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "wb") as file:
+                        file.write(self.source.read(name))
+            self.root = root
+        for path, text in patched.items():
+            if not path.startswith("sqlglot/"):
+                self.restore()
+                return None
+            with open(os.path.join(self.root, path), "w", encoding="utf-8", newline="") as file:
+                file.write(text)
+            self.written.append(path)
+        return self.root
+
+    def restore(self) -> None:
+        for path in self.written:
+            with open(os.path.join(self.root, path), "wb") as file:
+                file.write(self.source.read(path))
+        self.written = []
+
+
 class StandIn:
     def __init__(self, data_dir: str, source):
         self.spec = os.path.join(data_dir, "proxy_spec.json")
-        with open(os.path.join(data_dir, "proxy_baseline.json"), encoding="utf-8") as file:
-            self.baseline = json.load(file)
+        self._baseline_path = os.path.join(data_dir, "proxy_baseline.json")
+        self._baseline = None
         self.source = source  # pack.Pack of the pinned files
         self.workspace = None
         self.spent = 0.0
@@ -86,7 +121,10 @@ class StandIn:
                 log(f"stand-in failed (exit {result.returncode}); keeping the tests")
                 return set()
             digests = json.loads(result.stdout)
-            return {suite for suite in suites if digests.get(suite) == self.baseline.get(suite)}
+            if self._baseline is None:
+                with open(self._baseline_path, encoding="utf-8") as file:
+                    self._baseline = json.load(file)
+            return {suite for suite in suites if digests.get(suite) == self._baseline.get(suite)}
         except Exception as error:  # noqa: BLE001 - never let the stand-in cost a miss
             log(f"stand-in error {error!r}; keeping the tests")
             return set()

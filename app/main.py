@@ -49,6 +49,9 @@ def main() -> int:
 
     router = None
     stand_in = None
+    tpc_check = None
+    tpcds_number = None
+    workspace = None
     suite_numbers: dict[str, set[int]] = {}
     index_to_number: list[int | None] = []
     unmapped: set[int] = set()
@@ -60,6 +63,12 @@ def main() -> int:
         try:
             import standin
 
+            workspace = standin.Workspace(data._source)
+            if os.path.exists(os.path.join(MAPS, "tpc", "cases.json")):
+                import tpc
+
+                tpc_check = tpc.TPC(MAPS)
+                tpcds_number = number_by_id.get(tpc.TEST)
             if os.path.exists(os.path.join(MAPS, "proxy_baseline.json")):
                 stand_in = standin.StandIn(MAPS, data._source)
                 suite_numbers = {
@@ -107,6 +116,23 @@ def main() -> int:
                             notes.append(f"stand-in: {suite} unchanged, dropped {len(dropped)}")
                     if worth and not same:
                         notes.append(f"stand-in: {','.join(worth)} digests differ, tests kept")
+            if (
+                tpc_check is not None and tpcds_number in numbers and workspace is not None
+                and tpc_check.eligible(router.behavioral_files)
+            ):
+                cases = tpc_check.reached(router.behavioral_files, router.touched)
+                current = schedule.cost(schedule.split(numbers, durations), durations)
+                saving = current - schedule.cost(schedule.split(numbers - {tpcds_number}, durations), durations)
+                if tpc_check.worth(cases, saving):
+                    root = workspace.apply(router.patched)
+                    try:
+                        if root is not None and tpc_check.passes(root, cases, log):
+                            numbers.discard(tpcds_number)
+                            notes.append(f"tpc check: {len(cases)} reachable cases pass, dropped test_execute_tpcds")
+                        else:
+                            notes.append(f"tpc check: kept test_execute_tpcds ({len(cases)} cases)")
+                    finally:
+                        workspace.restore()
         except Everything as reason:
             numbers, level = set(every), f"everything: {reason}"
         except Exception as error:  # noqa: BLE001

@@ -22,6 +22,7 @@ def analyze(source: str) -> dict:
     tree = ast.parse(source)
     line_count = source.count("\n") + 1
     stmts: list[list] = []  # [start, end, parent, kind, body_start, def_line, qualname]
+    class_nodes: dict[int, ast.ClassDef] = {}
 
     def visit(node: ast.AST, parent: int, qual: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -41,6 +42,8 @@ def analyze(source: str) -> dict:
                     name, inner_qual = "", qual
                 index = len(stmts)
                 stmts.append([start, child.end_lineno, parent, kind, body_start, child.lineno, name])
+                if kind == CLASS:
+                    class_nodes[index] = child
                 visit(child, index, inner_qual)
             else:
                 visit(child, parent, qual)
@@ -51,6 +54,30 @@ def analyze(source: str) -> dict:
     for index, (start, end, *_rest) in enumerate(stmts):  # parents come before children
         for line in range(start, end + 1):
             line_stmt[line] = index
+
+    # Names each class body reads directly while the class is being created (e.g. `TRIE = new_trie(KEYS)`).
+    # Such a read is invisible to the attribute recorder, so the field-level route must not trust it.
+    class_refs: dict[str, list[str]] = {}
+
+    def body_reads(node, found):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return  # their own scopes: they cannot see the class namespace
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            found.add(node.id)
+        for child in ast.iter_child_nodes(node):
+            body_reads(child, found)
+
+    for index, entry in enumerate(stmts):
+        if entry[3] == CLASS:
+            node = class_nodes[index]
+            found: set[str] = set()
+            for statement in node.body:
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    for decorator in statement.decorator_list:
+                        body_reads(decorator, found)
+                    continue
+                body_reads(statement, found)
+            class_refs[str(index)] = sorted(found)
 
     lambdas = [
         [node.lineno, node.body.lineno, node.body.end_lineno]
@@ -75,6 +102,7 @@ def analyze(source: str) -> dict:
         "strings": strings,
         "continued": continued,
         "lines": line_count,
+        "class_refs": class_refs,
     }
 
 
@@ -99,6 +127,7 @@ class Structure:
         self.strings = data["strings"]
         self.continued = set(data["continued"])
         self.lines = data["lines"]
+        self.class_refs = {int(k): set(v) for k, v in data.get("class_refs", {}).items()}
 
     # ----- statements -----
     def innermost(self, line: int) -> int:
