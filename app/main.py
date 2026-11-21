@@ -16,7 +16,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import schedule  # noqa: E402
-from route import Data, Everything, Router  # noqa: E402
+from maps import Data  # noqa: E402
+from route import Everything, Router  # noqa: E402
 
 INPUT = os.environ.get("SHRAPNEL_INPUT", "/data")
 MAPS = os.environ.get("SHRAPNEL_MAPS", os.path.join(HERE, "data"))
@@ -48,11 +49,9 @@ def main() -> int:
     number_by_id = {t["id"]: t["number"] for t in tests}
 
     router = None
-    stand_in = None
     tpc_check = None
     tpcds_number = None
     workspace = None
-    suite_numbers: dict[str, set[int]] = {}
     index_to_number: list[int | None] = []
     unmapped: set[int] = set()
     try:
@@ -61,21 +60,14 @@ def main() -> int:
         index_to_number = [number_by_id.get(nodeid) for nodeid in data.tests]
         unmapped = every - {n for n in index_to_number if n is not None}
         try:
-            import standin
-
-            workspace = standin.Workspace(data._source)
             if os.path.exists(os.path.join(MAPS, "tpc", "cases.json")):
                 import tpc
 
+                workspace = tpc.Workspace(data._source)
                 tpc_check = tpc.TPC(MAPS)
                 tpcds_number = number_by_id.get(tpc.TEST)
-            if os.path.exists(os.path.join(MAPS, "proxy_baseline.json")):
-                stand_in = standin.StandIn(MAPS, data._source)
-                suite_numbers = {
-                    suite: {number_by_id[t] for t in tests if t in number_by_id} for suite, tests in standin.SUITES.items()
-                }
         except Exception as error:  # noqa: BLE001
-            log(f"stand-in unavailable ({error!r})")
+            log(f"tpc check unavailable ({error!r})")
         if unmapped:
             log(f"{len(unmapped)} tests have no map data; they join every non-empty selection")
     except Exception as error:  # noqa: BLE001 - any failure here must degrade to "run everything"
@@ -98,39 +90,22 @@ def main() -> int:
             if numbers and unmapped:
                 numbers |= unmapped
             level = "mapped"
-            if stand_in is not None and any(numbers & tests for tests in suite_numbers.values()):
-                import standin
-
-                if standin.eligible(router.behavioral_files):
-                    current = schedule.cost(schedule.split(numbers, durations), durations)
-                    worth = [
-                        suite for suite, tests in suite_numbers.items()
-                        if numbers & tests and current - schedule.cost(schedule.split(numbers - tests, durations), durations)
-                        > standin.CPU_COST_MS[suite]
-                    ]
-                    same = stand_in.unchanged_suites(router.patched, log, worth) if worth else set()
-                    for suite in same:
-                        dropped = numbers & suite_numbers[suite]
-                        if dropped:
-                            numbers -= dropped
-                            notes.append(f"stand-in: {suite} unchanged, dropped {len(dropped)}")
-                    if worth and not same:
-                        notes.append(f"stand-in: {','.join(worth)} digests differ, tests kept")
             if (
                 tpc_check is not None and tpcds_number in numbers and workspace is not None
                 and tpc_check.eligible(router.behavioral_files)
             ):
-                cases = tpc_check.reached(router.behavioral_files, router.touched)
+                exact, tree = tpc_check.plan(router.behavioral_files, router.touched)
                 current = schedule.cost(schedule.split(numbers, durations), durations)
                 saving = current - schedule.cost(schedule.split(numbers - {tpcds_number}, durations), durations)
-                if tpc_check.worth(cases, saving):
+                if tpc_check.worth(exact, tree, saving):
                     root = workspace.apply(router.patched)
+                    counts = f"{len(exact)} exact, {len(tree)} tree cases"
                     try:
-                        if root is not None and tpc_check.passes(root, cases, log):
+                        if root is not None and tpc_check.passes(root, exact, tree, log):
                             numbers.discard(tpcds_number)
-                            notes.append(f"tpc check: {len(cases)} reachable cases pass, dropped test_execute_tpcds")
+                            notes.append(f"tpc check: {counts} pass, dropped test_execute_tpcds")
                         else:
-                            notes.append(f"tpc check: kept test_execute_tpcds ({len(cases)} cases)")
+                            notes.append(f"tpc check: kept test_execute_tpcds ({counts})")
                     finally:
                         workspace.restore()
         except Everything as reason:
