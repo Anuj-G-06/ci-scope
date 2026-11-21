@@ -148,7 +148,9 @@ class PythonRoutes:
         # more precise than every reader of the enclosing class attribute.
         field = None
         if not any(1 <= ln <= s.lines and s.kind(ln) == "runtime" for ln in changed):
-            field = self._field_route(path, s, first, last, old_tree, new_tree, notes)
+            field = self._dict_route(path, s, first, last, old_tree, new_tree, notes)
+            if field is None:
+                field = self._field_route(path, s, first, last, old_tree, new_tree, notes)
         if field is not None:
             self._units += 1
             return field
@@ -184,6 +186,126 @@ class PythonRoutes:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
             return node.target.id, node
         return None
+
+    def _dict_route(self, path, s, first, last, old_tree, new_tree, notes) -> int | None:
+        """A change to the values of some entries of one class-body `NAME = {...}` literal reaches only the
+        tests that looked those keys up at runtime, or read the whole dict, provided nothing read those
+        values at import (into derived state or a subclass's copy) and the new values are evaluated at
+        class creation without side effects."""
+        if not path.startswith("sqlglot/"):
+            return None
+        index = s.common(first, last)
+        if index == -1 or s.stmts[index][3] != "simple" or s.span(index) != (first, last):
+            return None
+        parent = s.stmts[index][2]
+        if parent == -1 or s.stmts[parent][3] != "class":
+            return None
+        old, new = self._single_target(old_tree), self._single_target(new_tree)
+        if old is None or new is None or old[0] != new[0]:
+            return None
+        old_dict, new_dict = old[1].value, new[1].value
+        if not (isinstance(old_dict, ast.Dict) and isinstance(new_dict, ast.Dict)) or len(old_dict.keys) != len(new_dict.keys):
+            return None
+        tag = f"{module_name(path)}:{s.stmts[parent][6]}|{old[0]}"
+        reads = self.data.dict_reads(tag)
+        if reads is None or reads["iV"]:
+            return None  # not mapped, or its values feed something built at import
+        changed = []
+        for old_key, old_value, new_key, new_value in zip(old_dict.keys, old_dict.values, new_dict.keys, new_dict.values):
+            if (old_key is None) != (new_key is None) or (old_key is not None and not infect.same(old_key, new_key)):
+                return None  # a key or a ** entry changed
+            if infect.same(old_value, new_value):
+                continue
+            if old_key is None or not (isinstance(old_key, ast.Constant) and type(old_key.value) in (str, int)):
+                return None
+            changed.append((old_key.value, old_value, new_value))
+        if not changed:
+            return None
+        bits = self.data.bits(reads["V"]) if reads["V"] is not None else 0
+        for key, old_value, new_value in changed:
+            rep = f"s:{key}" if type(key) is str else f"i:{key}"
+            if rep in reads["iv"] or not self._safe_new_value(path, old_value, new_value):
+                return None
+            sid = reads["v"].get(rep)
+            if sid is not None:
+                bits |= self.data.bits(sid)
+        keys = ", ".join(repr(k) for k, _o, _n in changed)
+        notes.append(f"{path}:{first} dict entry {tag.split(':', 1)[1]}[{keys}] read by {bin(bits).count('1')}")
+        return bits | self.data.lazy_load_for(path)
+
+    @staticmethod
+    def _refs(node) -> set[str]:
+        """Dotted names (x, x.y.z) a value expression reads."""
+        found = set()
+        for sub in ast.walk(node):
+            parts = []
+            while isinstance(sub, ast.Attribute):
+                parts.append(sub.attr)
+                sub = sub.value
+            if isinstance(sub, ast.Name):
+                found.add(".".join([sub.id, *reversed(parts)]))
+        return found
+
+    def _safe_new_value(self, path, old_value, new_value) -> bool:
+        """The new value cannot raise or have side effects when the class is created: built from constants,
+        containers, lambdas and calls to closure factories, reading no name the old value did not read."""
+        old_refs = self._refs(old_value)
+        if not self._refs(new_value) <= old_refs:
+            return False
+
+        def safe(node) -> bool:
+            if isinstance(node, (ast.Constant, ast.Name, ast.Attribute)):
+                return True
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                return all(not isinstance(e, ast.Starred) and safe(e) for e in node.elts)
+            if isinstance(node, ast.Dict):
+                return all(k is not None and safe(k) and safe(v) for k, v in zip(node.keys, node.values))
+            if isinstance(node, ast.UnaryOp):
+                if isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+                    return isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float)
+                return isinstance(node.op, ast.Not) and safe(node.operand)
+            if isinstance(node, ast.Lambda):
+                return all(safe(d) for d in node.args.defaults + [d for d in node.args.kw_defaults if d is not None])
+            if isinstance(node, ast.Call):
+                return (
+                    isinstance(node.func, ast.Name) and self._closure_factory(path, node.func.id)
+                    and all(not isinstance(a, ast.Starred) and safe(a) for a in node.args)
+                    and all(k.arg is not None and safe(k.value) for k in node.keywords)
+                )
+            return False
+
+        return safe(new_value)
+
+    def _closure_factory(self, path: str, name: str) -> bool:
+        """`name`, as seen from `path`, is a plain function whose body only defines and returns a closure."""
+        cache = self.__dict__.setdefault("_factories", {})
+        key = (path, name)
+        if key not in cache:
+            cache[key] = self._find_factory(path, name, depth=0)
+        return cache[key]
+
+    def _find_factory(self, path: str, name: str, depth: int) -> bool:
+        if depth > 2 or not self.data.has_source(path):
+            return False
+        tree = ast.parse(self.data.source(path))
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                body = node.body[1:] if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) else node.body
+                inner = {n.name for n in body[:-1] if isinstance(n, ast.FunctionDef)}
+                return (
+                    not node.decorator_list and bool(body) and len(inner) == len(body) - 1
+                    and isinstance(body[-1], ast.Return)
+                    and (isinstance(body[-1].value, ast.Lambda) or (isinstance(body[-1].value, ast.Name) and body[-1].value.id in inner))
+                )
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                for alias in node.names:
+                    if (alias.asname or alias.name) == name:
+                        base = node.module.replace(".", "/")
+                        for candidate in (f"{base}.py", f"{base}/__init__.py"):
+                            if self.data.has_source(candidate):
+                                return self._find_factory(candidate, alias.name, depth + 1)
+                        return False
+        return False
 
     def _field_route(self, path, s, first, last, old_tree, new_tree, notes) -> int | None:
         """A change confined to one class-body `NAME = value` reaches only tests that read that

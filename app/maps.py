@@ -45,6 +45,8 @@ class Data:
         self._structure = Pack(os.path.join(root, "structure.pack"))
         values = os.path.join(root, "values.pack")
         self._values = Pack(values) if os.path.exists(values) else None
+        dicts = os.path.join(root, "dicts.pack")
+        self._dicts = Pack(dicts) if os.path.exists(dicts) else None
         self._cache: dict[tuple[str, str], object] = {}
         self.by_file: dict[str, int] = {}
         self._bit_of: dict[str, int] | None = None
@@ -122,6 +124,13 @@ class Data:
         if key in self.attr_import or key not in self.attr_read:
             return None
         return self.bits(self.attr_read[key])
+
+    def dict_reads(self, tag: str) -> dict | None:
+        """Recorded per-key reads of a class-level dict ("module:Class|NAME"), or None if not mapped."""
+        module = tag.split(":", 1)[0]
+        if self._dicts is None or module not in self._dicts.index:
+            return None
+        return self._cached("dicts", module, lambda: json.loads(self._dicts.read(module))).get(tag)
 
     # ----- recorded comparison states (see infect.py) -----
     def has_values(self, path: str) -> bool:

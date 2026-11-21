@@ -52,6 +52,8 @@ def main() -> int:
     tpc_check = None
     tpcds_number = None
     workspace = None
+    max_nodes = None
+    max_nodes_number = None
     index_to_number: list[int | None] = []
     unmapped: set[int] = set()
     try:
@@ -66,6 +68,10 @@ def main() -> int:
                 workspace = tpc.Workspace(data._source)
                 tpc_check = tpc.TPC(MAPS)
                 tpcds_number = number_by_id.get(tpc.TEST)
+                import maxnodes
+
+                max_nodes = maxnodes.MaxNodes()
+                max_nodes_number = number_by_id.get(maxnodes.TEST)
         except Exception as error:  # noqa: BLE001
             log(f"tpc check unavailable ({error!r})")
         if unmapped:
@@ -108,6 +114,15 @@ def main() -> int:
                             notes.append(f"tpc check: kept test_execute_tpcds ({counts})")
                     finally:
                         workspace.restore()
+            if max_nodes is not None and max_nodes_number in numbers and workspace is not None:
+                current = schedule.cost(schedule.split(numbers, durations), durations)
+                saving = current - schedule.cost(schedule.split(numbers - {max_nodes_number}, durations), durations)
+                if max_nodes.worth(router.behavioral_files, saving):
+                    if max_nodes.passes(workspace, router.patched, log):
+                        numbers.discard(max_nodes_number)
+                        notes.append("max_nodes check: scaled run passes, dropped test_max_nodes")
+                    else:
+                        notes.append("max_nodes check: kept test_max_nodes")
         except Everything as reason:
             numbers, level = set(every), f"everything: {reason}"
         except Exception as error:  # noqa: BLE001

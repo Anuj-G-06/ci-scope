@@ -1,7 +1,7 @@
 {
  "sqlglot_commit": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa",
  "tests": 1621,
- "distinct_sets": 35002,
+ "distinct_sets": 42544,
  "set_width_bytes": 203,
  "line_files": 250,
  "snapshot_files": 255,
