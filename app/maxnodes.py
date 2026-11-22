@@ -18,7 +18,7 @@ import tracemalloc
 
 TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 CHECK_MS = 1500  # CPU of one run of this script, rounded up
-CPU_FACTOR = 2.0
+CPU_FACTOR = 1.3  # as in tpc.py
 SLOWER, HUNGRIER = 3.0, 1.25  # patched/pinned limits on the full parse's time and peak memory
 BUDGET_SECONDS = 30.0
 

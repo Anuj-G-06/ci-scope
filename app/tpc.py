@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 # The test's class setup also loads tables through Table: a change there is outside any case.
 NOT_ELIGIBLE = {"sqlglot/executor/table.py"}
-CPU_FACTOR = 2.0  # board CPU has measured up to ~2x ours
+CPU_FACTOR = 1.3  # board CPU has tracked ours at ~1.1-1.3x (v7-v10 board runs)
 # CPU of the check subprocess, measured in the container: interpreter + sqlglot import; per tree case
 # (parse, pickle, optimize, fingerprint, DuckDB SQL); per parsed-only case; pandas + expected results;
 # per executed case.

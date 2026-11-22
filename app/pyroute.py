@@ -137,6 +137,7 @@ class PythonRoutes:
             for route in (dict_route, field_route):
                 found = route(self.data, path, s, first, last, old_tree, new_tree, notes)
                 if found is not None:
+                    self.touched.append((path, first, last, False))  # runs at import: the TPC check must know
                     return found
         bits = self._route_lines(path, s, lines, notes)
         imported = self._import_lines(path)
