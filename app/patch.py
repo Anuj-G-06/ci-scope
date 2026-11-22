@@ -58,6 +58,11 @@ class Block:
     def insertion(self) -> bool:
         return not self.removed
 
+    @property
+    def lines(self):
+        """The old lines this change touches: an insertion touches the lines on both sides of it."""
+        return (self.after, self.after + 1) if self.insertion else range(self.first, self.last + 1)
+
 
 def _strip_prefix(path: str) -> str | None:
     path = path.split("\t", 1)[0].strip()

@@ -1,6 +1,6 @@
 """Runtime check of test_execute_tpcds on the cases a patch can reach, run on the patched sqlglot.
 
-    python -I -B tpc_exact.py <dir holding the sqlglot package> <data_dir> <exact cases> [<tree cases>]
+    python -I -B tpc_exact.py <dir holding the sqlglot package> <data_dir> <exact cases> [<tree cases> [<max fallbacks>]]
     python -I -B tpc_exact.py <dir holding the pinned sqlglot> <data_dir> --trees > trees.json
 
 Exact cases do what the test does: parse in the test process, pickle the expression to a worker and
@@ -9,10 +9,11 @@ using the test's own assert_frame_equal call. The DuckDB result was computed fro
 it is only valid while the patch leaves the case's DuckDB SQL unchanged; otherwise the verdict is
 "unknown" and the caller keeps the test.
 
-Tree cases (optimizer-only patches) run the real execute() up to the planner and fingerprint the
-optimized tree it would plan: every node, argument, type, comment and meta value, plus its parent links
-and any shared nodes. A case whose fingerprint equals the pinned one is cleared; any other goes to the
-exact check.
+Tree cases (patches that change only runtime lines the planner and executor do not run for that case)
+first check that the case's DuckDB SQL is unchanged, then parse, pickle and run the real execute() up to
+the planner, and fingerprint the optimized tree it would plan: every node, argument, type, comment, meta
+value and cached hash, plus its parent links and any shared nodes. A case whose fingerprint equals the
+pinned one is cleared; any other goes to the exact check.
 
 Prints {"verdict": "pass" | "fail" | "unknown", "case": i, "why": ...}.
 """
@@ -26,7 +27,7 @@ import os
 import pickle
 import sys
 
-MAX_FALLBACKS = 6  # tree cases that differ and must be executed; more and the test is kept
+MAX_FALLBACKS = 6  # default: tree cases that differ and may be executed; more and the test is kept
 
 
 def open_file(file_name):
@@ -69,6 +70,8 @@ def fingerprint(root, exp) -> str:
                 continue
             seen[id(value)] = len(seen)
             out.append("E:" + type(value).__name__)
+            if getattr(value, "_hash", None) is not None:
+                out.append("H")  # a cached hash the planner's lookups would trust, stale or not
             if parent is not None and (value.parent is not parent or value.arg_key != key or value.index != index):
                 out.append("P!")  # a stale parent link
             if value.comments:
@@ -96,7 +99,7 @@ def fingerprint(root, exp) -> str:
     return hashlib.sha256("\x02".join(out).encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "") -> None:
+def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", max_fallbacks: str = "") -> None:
     sys.path.insert(0, package_dir)
     import logging
 
@@ -113,6 +116,15 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "") ->
 
     def result(verdict, case=None, why=""):
         sys.stdout.write(json.dumps({"verdict": verdict, "case": case, "why": why[:300]}))
+
+    def duckdb_changed(i):
+        """(verdict, why) when the test's DuckDB side differs from the pinned one, so the pinned expected
+        result no longer applies; None when it is the same SQL."""
+        try:
+            sql = transpile(cases[i]["sql"], write="duckdb")[0]
+        except Exception as error:  # noqa: BLE001
+            return "fail", f"duckdb transpile {type(error).__name__}"
+        return None if sql == cases[i]["duckdb"] else ("unknown", "the DuckDB SQL changed, so the pinned expected result does not apply")
 
     class Planned(Exception):
         pass
@@ -147,6 +159,10 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "") ->
     if tree_indices:
         with open(os.path.join(root, "trees.json"), encoding="utf-8") as file:
             pinned = json.load(file)
+        for i in tree_indices:  # cheap, and it settles most patches that change the result early
+            changed = duckdb_changed(i)
+            if changed:
+                return result(changed[0], i, changed[1])
         fallbacks = []
         for i in tree_indices:
             try:
@@ -155,7 +171,7 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "") ->
                 same = False
             if not same:
                 fallbacks.append(i)
-                if len(fallbacks) > MAX_FALLBACKS:
+                if len(fallbacks) > (int(max_fallbacks) if max_fallbacks else MAX_FALLBACKS):
                     return result("unknown", i, "too many optimized trees differ from the pinned ones")
         indices = sorted(set(indices) | set(fallbacks))
 
@@ -171,12 +187,9 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "") ->
             return result("fail", i, f"parse/pickle {type(error).__name__}: {error}")
         if not case["execute"]:
             continue  # mp_execute returns None: nothing else runs for this case
-        try:
-            duckdb_sql = transpile(case["sql"], write="duckdb")[0]
-        except Exception as error:  # noqa: BLE001
-            return result("fail", i, f"duckdb transpile {type(error).__name__}")
-        if duckdb_sql != case["duckdb"]:
-            return result("unknown", i, "the DuckDB SQL changed, so the pinned expected result does not apply")
+        changed = duckdb_changed(i)
+        if changed:
+            return result(changed[0], i, changed[1])
         if expected is None:
             import numpy as np
             import pandas as pd
@@ -204,4 +217,4 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "") ->
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:5])
+    main(*sys.argv[1:6])

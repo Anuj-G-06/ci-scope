@@ -18,6 +18,7 @@ Abstract operands, as recorded by the mapping run:
 from __future__ import annotations
 
 import ast
+import hashlib
 
 
 class Unknown(Exception):
@@ -35,30 +36,18 @@ def _kind(a) -> str:
     return tag
 
 
+_DECODE = {  # exact Python value for primitive abstractions
+    "N": lambda a: None, "b": lambda a: bool(a[1]), "i": lambda a: a[1], "I": lambda a: int(a[1]),
+    "f": lambda a: float(a[1]), "s": lambda a: a[1], "y": lambda a: bytes.fromhex(a[1]),
+    "t": lambda a: tuple(_value(x) for x in a[1]),
+    "ss": lambda a: a[-1], "es": lambda a: a[-1], "ei": lambda a: a[-1],  # compare as their str/int value
+}
+
+
 def _value(a):
-    """Exact Python value for primitive abstractions."""
-    tag = a[0]
-    if tag == "N":
-        return None
-    if tag == "b":
-        return bool(a[1])
-    if tag == "i":
-        return a[1]
-    if tag == "I":
-        return int(a[1])
-    if tag == "f":
-        return float(a[1])
-    if tag == "s":
-        return a[1]
-    if tag == "y":
-        return bytes.fromhex(a[1])
-    if tag == "t":
-        return tuple(_value(x) for x in a[1])
-    if tag in ("ss", "es"):
-        return a[-1]  # equality and ordering behave as for the str value
-    if tag == "ei":
-        return a[-1]
-    raise Unknown(tag)
+    if a[0] not in _DECODE:
+        raise Unknown(a[0])
+    return _DECODE[a[0]](a)
 
 
 def _comparable(a) -> bool:
@@ -77,12 +66,8 @@ def _equal(a, b, same: bool | None) -> bool:
             text = other[-1]
             if len(text) != hashed[1]:
                 return False
-            import hashlib  # rare: only long strings are hashed
-
             return hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest() == hashed[2]
         if hashed[0] == "Y" and other[0] == "y":
-            import hashlib
-
             data = bytes.fromhex(other[1])
             return len(data) == hashed[1] and hashlib.sha1(data).hexdigest() == hashed[2]
         raise Unknown("hashed value")
@@ -95,41 +80,29 @@ def _equal(a, b, same: bool | None) -> bool:
     return _value(a) == _value(b)
 
 
+_ORDER = {
+    "<": lambda x, y: x < y, "<=": lambda x, y: x <= y, ">": lambda x, y: x > y, ">=": lambda x, y: x >= y,
+    "in": lambda x, y: x in y, "not in": lambda x, y: x not in y,
+}
+
+
 def _outcome(op: str, a, b, same: bool | None):
     """('v', result) or ('raise', exception name)."""
     try:
-        if op == "is":
+        if op in ("is", "is not"):
             if same is None:
                 raise Unknown("identity unknown")
-            return ("v", same)
-        if op == "is not":
-            if same is None:
-                raise Unknown("identity unknown")
-            return ("v", not same)
-        if op == "==":
-            return ("v", _equal(a, b, same))
-        if op == "!=":
-            return ("v", not _equal(a, b, same))
-        if not (_comparable(a) and _comparable(b)):
+            return ("v", same if op == "is" else not same)
+        if op in ("==", "!="):
+            equal = _equal(a, b, same)
+            return ("v", equal if op == "==" else not equal)
+        if op not in _ORDER or not (_comparable(a) and _comparable(b)):
             raise Unknown("ordering or membership on objects")
-        left, right = _value(a), _value(b)
-        if op == "<":
-            return ("v", left < right)
-        if op == "<=":
-            return ("v", left <= right)
-        if op == ">":
-            return ("v", left > right)
-        if op == ">=":
-            return ("v", left >= right)
-        if op == "in":
-            return ("v", left in right)
-        if op == "not in":
-            return ("v", left not in right)
+        return ("v", _ORDER[op](_value(a), _value(b)))
     except Unknown:
         raise
     except Exception as error:  # noqa: BLE001 - the original code would raise this too
         return ("raise", type(error).__name__)
-    raise Unknown(op)
 
 
 _OPS = {
@@ -138,20 +111,16 @@ _OPS = {
 }
 
 
+_CONSTANTS = {
+    type(None): lambda v: ("N",), bool: lambda v: ("b", int(v)), int: lambda v: ("i", v),
+    float: lambda v: ("f", repr(v)), str: lambda v: ("s", v), bytes: lambda v: ("y", v.hex()),
+}
+
+
 def _constant_abs(value):
-    if value is None:
-        return ("N",)
-    if type(value) is bool:
-        return ("b", int(value))
-    if type(value) is int:
-        return ("i", value)
-    if type(value) is float:
-        return ("f", repr(value))
-    if type(value) is str:
-        return ("s", value)
-    if type(value) is bytes:
-        return ("y", value.hex())
-    raise Unknown("constant")
+    if type(value) not in _CONSTANTS:
+        raise Unknown("constant")
+    return _CONSTANTS[type(value)](value)
 
 
 def same(a, b) -> bool:
@@ -244,3 +213,33 @@ def changed_comparisons(old: ast.AST, new: ast.AST) -> list[tuple[ast.AST, ast.A
         return type(a) is type(b) and a == b
 
     return pairs if walk(old, new) and pairs else None
+
+
+def proven(data, path: str, pairs, offset: int, notes: list[str]) -> int:
+    """Tests whose every recorded state gives the same outcome for every changed comparison."""
+    result = None
+    for old_expr, new_expr in pairs:
+        site = core(old_expr)
+        key = f"{site.lineno + offset}:{site.col_offset}:{site.end_lineno + offset}:{site.end_col_offset}"
+        entries, overflow = data.values_at(path, key)
+        if not entries:
+            notes.append(f"{path}:{key} no recorded states")
+            return 0
+        recorded = infected = 0
+        for left, right, same_lr, sid in entries:
+            bits = data.bits(sid)
+            recorded |= bits
+            try:
+                if left == "?" or evaluate(old_expr, site, left, right, bool(same_lr)) != evaluate(
+                    new_expr, site, left, right, bool(same_lr)
+                ):
+                    infected |= bits
+            except Unknown:
+                infected |= bits
+        if overflow is not None:
+            recorded |= data.bits(overflow)
+            infected |= data.bits(overflow)
+        clean = recorded & ~infected
+        result = clean if result is None else result & clean
+        notes.append(f"{path}:{key} states {len(entries)}, clean tests {bin(clean).count('1')}")
+    return result or 0

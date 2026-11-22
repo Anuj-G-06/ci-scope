@@ -40,6 +40,16 @@ def bits_to_numbers(bits: int, index_to_number: list[int | None]) -> set[int]:
     return numbers
 
 
+def reads_any(data: Data, files, nodeid: str) -> bool:
+    """Whether the test may read any of these non-code files (a file with no recorded readers counts)."""
+    bit = data.bit_of(nodeid)
+    for path in files:
+        sid = data.file_readers.get(path)
+        if bit is None or sid is None or data.bits(sid) & bit:
+            return True
+    return False
+
+
 def main() -> int:
     started = time.process_time()
     with open(os.path.join(INPUT, "tests.json"), "rb") as file:
@@ -96,28 +106,35 @@ def main() -> int:
             if numbers and unmapped:
                 numbers |= unmapped
             level = "mapped"
+            # The checks below run patched sqlglot code; any other changed file must be one the
+            # checked test never reads (a fixture of other tests, say).
+            code = {p for p in router.behavioral_files if p.endswith(".py")}
+            other = router.behavioral_files - code
             if (
                 tpc_check is not None and tpcds_number in numbers and workspace is not None
-                and tpc_check.eligible(router.behavioral_files)
+                and tpc_check.eligible(code) and not reads_any(data, other, tpc.TEST)
             ):
-                exact, tree = tpc_check.plan(router.behavioral_files, router.touched)
+                exact, tree = tpc_check.plan(code, router.touched)
                 current = schedule.cost(schedule.split(numbers, durations), durations)
                 saving = current - schedule.cost(schedule.split(numbers - {tpcds_number}, durations), durations)
                 if tpc_check.worth(exact, tree, saving):
                     root = workspace.apply(router.patched)
                     counts = f"{len(exact)} exact, {len(tree)} tree cases"
                     try:
-                        if root is not None and tpc_check.passes(root, exact, tree, log):
+                        if root is not None and tpc_check.passes(root, exact, tree, log, tpc_check.fallbacks(exact, tree, saving)):
                             numbers.discard(tpcds_number)
                             notes.append(f"tpc check: {counts} pass, dropped test_execute_tpcds")
                         else:
                             notes.append(f"tpc check: kept test_execute_tpcds ({counts})")
                     finally:
                         workspace.restore()
-            if max_nodes is not None and max_nodes_number in numbers and workspace is not None:
+            if (
+                max_nodes is not None and max_nodes_number in numbers and workspace is not None
+                and not reads_any(data, other, maxnodes.TEST)
+            ):
                 current = schedule.cost(schedule.split(numbers, durations), durations)
                 saving = current - schedule.cost(schedule.split(numbers - {max_nodes_number}, durations), durations)
-                if max_nodes.worth(router.behavioral_files, saving):
+                if max_nodes.worth(code, saving):
                     if max_nodes.passes(workspace, router.patched, log):
                         numbers.discard(max_nodes_number)
                         notes.append("max_nodes check: scaled run passes, dropped test_max_nodes")

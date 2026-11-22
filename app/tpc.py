@@ -5,10 +5,11 @@ that runs at import time, or any behavioral file we have no line data for, reach
 
 Two ways to clear a case:
   - exact: execute it on the real tables with the patched code and compare with DuckDB's result;
-  - tree (optimizer-only patches): the executor gets nothing from the optimizer but the optimized tree,
-    so a case whose optimized tree equals the pinned one, and whose planning and execution run none of
-    the changed lines, behaves exactly as on the pinned commit. Cases that fail the tree test fall back
-    to the exact check.
+  - tree (any patch that changes only runtime lines): planning and execution get nothing from the
+    test's parse, pickle round trip and optimizer but the optimized tree, so a case whose optimized
+    tree and DuckDB SQL equal the pinned ones, and whose planning and execution run none of the changed
+    lines, behaves exactly as on the pinned commit. Cases that fail the tree test fall back to the exact
+    check. Cases the test only parses and pickles are re-parsed and pickled, which is all it does.
 The check only runs when its CPU estimate (with a safety factor for slower machines) is below the
 expected scheduled seconds it saves.
 """
@@ -28,9 +29,11 @@ TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 # The test's class setup also loads tables through Table: a change there is outside any case.
 NOT_ELIGIBLE = {"sqlglot/executor/table.py"}
 CPU_FACTOR = 2.0  # board CPU has measured up to ~2x ours
-FIXED_MS, EXECUTED_MS, PARSED_MS = 1300, 250, 10  # exact check: pandas + sqlglot imports, per case
-TREE_FIXED_MS, TREE_MS = 900, 80  # tree check: sqlglot import, per case
-PASS_RATE = 0.7  # how often a selected-but-checkable TPC-DS test passed on our labeled mutants
+# CPU of the check subprocess, measured in the container: interpreter + sqlglot import; per tree case
+# (parse, pickle, optimize, fingerprint, DuckDB SQL); per parsed-only case; pandas + expected results;
+# per executed case.
+BASE_MS, TREE_MS, PARSED_MS, PANDAS_MS, EXECUTED_MS = 300, 40, 3, 700, 170
+PASS_RATE = 0.6  # how often a selected TPC-DS test passed on our labeled commits (22 of 37)
 BUDGET_SECONDS = float(os.environ.get("SHRAPNEL_TPC_BUDGET", "60"))  # total wall time for all checks in a run
 
 
@@ -99,9 +102,10 @@ class TPC:
                 self.trees = {int(k): v for k, v in json.load(file).items()}
         self._loaded = True
 
-    def eligible(self, behavioral_files) -> bool:
-        return bool(behavioral_files) and all(
-            p.startswith("sqlglot/") and p.endswith(".py") and p not in NOT_ELIGIBLE for p in behavioral_files
+    def eligible(self, code_files) -> bool:
+        """sqlglot code the check can run patched (other changed files are ones the test never reads)."""
+        return bool(code_files) and all(
+            p.startswith("sqlglot/") and p.endswith(".py") and p not in NOT_ELIGIBLE for p in code_files
         )
 
     def reached(self, behavioral_files, touched) -> set[int]:
@@ -119,32 +123,38 @@ class TPC:
         return cases
 
     def plan(self, behavioral_files, touched) -> tuple[set[int], set[int]]:
-        """(exact cases, tree cases) to clear."""
+        """(exact cases, tree cases) to clear. Exact cases include those the test only parses and pickles."""
         cases = self.reached(behavioral_files, touched)
-        optimizer_only = all(p.startswith("sqlglot/optimizer/") for p in behavioral_files)
-        if not (optimizer_only and self.trees is not None and self._post is not None and all(r for *_x, r in touched)):
+        if self.trees is None or self._post is None or not all(r for *_x, r in touched):
             return cases, set()
-        # The parser is unchanged, so cases the test only parses and pickles are cleared already.
-        exact: set[int] = set()
+        post: set[int] = set()  # cases whose planning or execution runs a changed line
         for path, first, last, _runtime in touched:
             per_line = self._post.get(path, {})
             for line in range(first, last + 1):
-                exact.update(per_line.get(str(line), ()))
+                post.update(per_line.get(str(line), ()))
         executed = cases & self.executed
-        exact &= executed
-        return exact, executed - exact
+        return (cases - self.executed) | (post & executed), executed - post
+
+    def _cost(self, exact: set[int], tree: set[int]) -> int:
+        executed = len(exact & self.executed)
+        cost = BASE_MS + TREE_MS * len(tree) + PARSED_MS * (len(exact) - executed)
+        return cost + (PANDAS_MS + EXECUTED_MS * executed if executed else 0)
 
     def worth(self, exact: set[int], tree: set[int], saving_ms: int) -> bool:
         self._load()
-        cost = 0
-        if tree:
-            cost += TREE_FIXED_MS + TREE_MS * len(tree)
-        if exact:
-            executed = len(exact & self.executed)
-            cost += FIXED_MS + EXECUTED_MS * executed + PARSED_MS * (len(exact) - executed)
-        return PASS_RATE * saving_ms > CPU_FACTOR * cost
+        if not exact and not tree:
+            return saving_ms > 0  # nothing to check: passes() clears it without a subprocess
+        return PASS_RATE * saving_ms > CPU_FACTOR * self._cost(exact, tree)
 
-    def passes(self, workspace: str, exact: set[int], tree: set[int], log) -> bool:
+    def fallbacks(self, exact: set[int], tree: set[int], saving_ms: int) -> int:
+        """How many tree cases that differ from the pinned trees the check may still execute exactly
+        before its expected CPU outweighs the expected saving."""
+        spare = PASS_RATE * saving_ms / CPU_FACTOR - self._cost(exact, tree)
+        if not exact & self.executed:
+            spare -= PANDAS_MS
+        return max(0, min(len(tree), int(spare // EXECUTED_MS)))
+
+    def passes(self, workspace: str, exact: set[int], tree: set[int], log, fallbacks: int = 6) -> bool:
         if not exact and not tree:
             return True
         remaining = BUDGET_SECONDS - self.spent
@@ -155,7 +165,7 @@ class TPC:
         try:
             result = subprocess.run(
                 [sys.executable, "-I", "-B", os.path.join(HERE, "tpc_exact.py"), workspace, self.data_dir,
-                 ",".join(str(c) for c in sorted(exact)), ",".join(str(c) for c in sorted(tree))],
+                 ",".join(str(c) for c in sorted(exact)), ",".join(str(c) for c in sorted(tree)), str(fallbacks)],
                 env={"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp")},
                 capture_output=True, text=True, timeout=remaining,
             )
