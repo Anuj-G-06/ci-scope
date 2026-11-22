@@ -110,9 +110,10 @@ def main() -> int:
             # checked test never reads (a fixture of other tests, say).
             code = {p for p in router.behavioral_files if p.endswith(".py")}
             other = router.behavioral_files - code
+            applied = all(p in router.patched for p in code)  # deleted or renamed code: no workspace shows it
             if (
                 tpc_check is not None and tpcds_number in numbers and workspace is not None
-                and tpc_check.eligible(code) and not reads_any(data, other, tpc.TEST)
+                and applied and tpc_check.eligible(code) and not reads_any(data, other, tpc.TEST)
             ):
                 exact, tree = tpc_check.plan(code, router.touched)
                 current = schedule.cost(schedule.split(numbers, durations), durations)
@@ -130,7 +131,7 @@ def main() -> int:
                         workspace.restore()
             if (
                 max_nodes is not None and max_nodes_number in numbers and workspace is not None
-                and not reads_any(data, other, maxnodes.TEST)
+                and applied and not reads_any(data, other, maxnodes.TEST)
             ):
                 current = schedule.cost(schedule.split(numbers, durations), durations)
                 saving = current - schedule.cost(schedule.split(numbers - {max_nodes_number}, durations), durations)

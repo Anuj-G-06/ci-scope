@@ -100,7 +100,18 @@ class TPC:
         if os.path.exists(trees):
             with open(trees, encoding="utf-8") as file:
                 self.trees = {int(k): v for k, v in json.load(file).items()}
+        closure = os.path.join(root, "closure.json")  # written at image build: see build_structure.py
+        self.closure = None
+        if os.path.exists(closure):
+            with open(closure, encoding="utf-8") as file:
+                self.closure = set(json.load(file))
         self._loaded = True
+
+    def _before_planning(self, path: str) -> bool:
+        """An import-time change in this file reaches a case only before the optimizer returns: neither
+        planning nor execution imports it, directly or not (the DuckDB modules the test's reference SQL
+        comes from, say). The tree check then sees all of it: the parse, the optimized tree, the DuckDB SQL."""
+        return self.closure is not None and path.startswith("sqlglot/") and path not in self.closure
 
     def eligible(self, code_files) -> bool:
         """sqlglot code the check can run patched (other changed files are ones the test never reads)."""
@@ -125,7 +136,11 @@ class TPC:
     def plan(self, behavioral_files, touched) -> tuple[set[int], set[int]]:
         """(exact cases, tree cases) to clear. Exact cases include those the test only parses and pickles."""
         cases = self.reached(behavioral_files, touched)
-        if self.trees is None or self._post is None or not all(r for *_x, r in touched):
+        covered = {path for path, *_ in touched}
+        if (
+            self.trees is None or self._post is None or any(path not in covered for path in behavioral_files)
+            or not all(runtime or self._before_planning(path) for path, _first, _last, runtime in touched)
+        ):
             return cases, set()
         post: set[int] = set()  # cases whose planning or execution runs a changed line
         for path, first, last, _runtime in touched:
