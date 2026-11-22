@@ -78,6 +78,14 @@ class Data:
         offset = sid * self.width
         return int.from_bytes(self.sets[offset:offset + self.width], "little")
 
+    def named(self, names) -> int:
+        """Tests whose function name is one of `names`, in any class of any file."""
+        bits = 0
+        for i, nodeid in enumerate(self.tests):
+            if nodeid.rsplit("::", 1)[-1].split("[", 1)[0] in names:
+                bits |= 1 << i
+        return bits
+
     def bit_of(self, nodeid: str) -> int | None:
         if self._bit_of is None:
             self._bit_of = {test: 1 << i for i, test in enumerate(self.tests)}

@@ -13,6 +13,7 @@ from fixtures import FIXTURE_LOADER, TPC_FIXTURES, tpc_fixture_tests
 from maps import Data
 from patch import FilePatch, PatchError, apply, parse
 from pyroute import Everything, PythonRoutes
+from testmod import module_local
 
 # Files no collected test imports or reads, and that pytest does not read as configuration.
 INERT_FILES = {
@@ -23,7 +24,8 @@ INERT_FILES = {
     "sqlglot/py.typed",
 }
 INERT_PREFIXES = ("posts/", ".github/", "benchmarks/", "pdoc/")
-CONFIG_FILES = {"pyproject.toml": ("tool.ruff",), "setup.cfg": ("mypy",)}
+# Sections no test reads: tests import sqlglot from the checkout, so packaging metadata never applies.
+CONFIG_FILES = {"pyproject.toml": ("tool.ruff", "project", "build-system", "tool.setuptools", "tool.uv"), "setup.cfg": ("mypy",)}
 PYTEST_FILES = {"conftest.py", "pytest.ini", "tox.ini"}
 
 
@@ -64,27 +66,21 @@ class Router(PythonRoutes):
     def route_file(self, fp: FilePatch, notes: list[str]) -> int:
         path = fp.path
         name = posixpath.basename(path)
-        if fp.renamed or fp.binary:
-            if fp.binary and path.startswith("tests/fixtures/") and path in self.data.file_readers:
+        if fp.binary:
+            if path.startswith("tests/fixtures/") and path in self.data.file_readers:
                 notes.append(f"{path}: binary fixture -> readers")
                 self._units += 1
                 return self.data.bits(self.data.file_readers[path])
-            raise Everything(f"{path}: rename or binary change")
+            raise Everything(f"{path}: binary change")
+        if fp.renamed:  # the old path is gone (unless copied); the new one is a new file
+            old = fp.old_path
+            source = self.data.source(old) if self.data.has_source(old) else None
+            bits = 0 if fp.copied else self.route_deleted(old, notes)
+            return bits | self.route_new(fp.new_path, self._new_text(source, fp), notes)
         if fp.old_path is None:  # new file
-            if name in PYTEST_FILES or (name.startswith("test_") and name.endswith(".py")) or (
-                path.startswith("tests/") and name == "__init__.py"
-            ):
-                raise Everything(f"{path}: new file pytest would collect or load")
-            parts = path.split("/")
-            if (len(parts) == 1 and name.endswith((".py", ".pth"))) or (len(parts) == 2 and name == "__init__.py"):
-                # The checkout is on sys.path ahead of the standard library and site-packages: a new
-                # top-level module or package (json.py, sitecustomize.py, pandas/__init__.py) can
-                # shadow what every test imports.
-                raise Everything(f"{path}: new top-level module")
-            notes.append(f"{path}: new file nothing imports")
-            return 0
+            return self.route_new(path, self._new_text("", fp), notes)
         if fp.new_path is None:
-            raise Everything(f"{path}: deleted file")
+            return self.route_deleted(path, notes)
         if path in INERT_FILES or path.startswith(INERT_PREFIXES):
             notes.append(f"{path}: inert")
             return 0
@@ -103,6 +99,55 @@ class Router(PythonRoutes):
         if path not in self.data.repo_files:
             raise Everything(f"{path}: not a file of the pinned commit")
         raise Everything(f"{path}: no route for this kind of file")
+
+    @staticmethod
+    def _new_text(before: str | None, fp: FilePatch) -> str | None:
+        if before is None:
+            return None
+        try:
+            return apply(before, fp.hunks)[0]
+        except PatchError:
+            return None
+
+    def route_new(self, path: str, text: str | None, notes: list[str]) -> int:
+        """A new file reaches nothing that exists, unless pytest loads it or it shadows a module."""
+        name = posixpath.basename(path)
+        if name in PYTEST_FILES or (path.startswith("tests/") and name == "__init__.py"):
+            raise Everything(f"{path}: new file pytest would load")
+        parts = path.split("/")
+        if (len(parts) == 1 and name.endswith((".py", ".pth"))) or (len(parts) == 2 and name == "__init__.py"):
+            # The checkout is on sys.path ahead of the standard library and site-packages: a new
+            # top-level module or package (json.py, sitecustomize.py, pandas/__init__.py) can
+            # shadow what every test imports.
+            raise Everything(f"{path}: new top-level module")
+        if name == "__init__.py" and posixpath.dirname(path) + ".py" in self.data.repo_files:
+            raise Everything(f"{path}: new package shadows a module")  # a package wins over a .py file
+        if name.startswith("test_") and name.endswith(".py"):
+            # pytest collects it, but none of its tests is numbered: only its import can reach others.
+            if text is None or not module_local(text):
+                raise Everything(f"{path}: new test module that does more than define names")
+            notes.append(f"{path}: new test module that only defines its own names")
+            return 0
+        notes.append(f"{path}: new file nothing imports")
+        return 0
+
+    def route_deleted(self, path: str, notes: list[str]) -> int:
+        """A deleted file breaks exactly the tests that load it: a module's importers (every test whose
+        process imported it, its own tests among them) or a fixture's readers."""
+        if path in INERT_FILES or path.startswith(INERT_PREFIXES):
+            notes.append(f"{path}: inert file deleted")
+            return 0
+        name = posixpath.basename(path)
+        if path.endswith(".py") and name not in PYTEST_FILES and path in self.data.module_users and len(path.split("/")) > 1:
+            bits = self.data.users_of_module(path) | self.data.by_file.get(path, 0)
+            bits |= self.data.lazy_load_for(path) if path.startswith("sqlglot/") else 0
+        elif path.startswith("tests/fixtures/") and path in self.data.file_readers:
+            bits = self.data.bits(self.data.file_readers[path])
+        else:
+            raise Everything(f"{path}: deleted file")
+        self._units += 1
+        notes.append(f"{path}: deleted -> loaders {bin(bits).count('1')}")
+        return bits
 
     # ----- configuration -----
     def route_config(self, fp: FilePatch, notes: list[str]) -> int:

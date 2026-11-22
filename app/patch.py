@@ -24,7 +24,7 @@ class Hunk:
 
 
 class FilePatch:
-    __slots__ = ("old_path", "new_path", "hunks", "binary", "renamed")
+    __slots__ = ("old_path", "new_path", "hunks", "binary", "renamed", "copied")
 
     def __init__(self, old_path: str | None, new_path: str | None):
         self.old_path = old_path  # None for a new file
@@ -32,6 +32,7 @@ class FilePatch:
         self.hunks: list[Hunk] = []
         self.binary = False
         self.renamed = False
+        self.copied = False  # a copy keeps its source; a rename removes it
 
     @property
     def path(self) -> str:
@@ -136,6 +137,7 @@ def parse(text: str) -> list[FilePatch]:
             current.new_path = None
         elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
             current.renamed = True
+            current.copied = current.copied or line.startswith("copy ")
         elif line.startswith("Binary files ") or line.startswith("GIT binary patch"):
             current.binary = True
     for f in files:

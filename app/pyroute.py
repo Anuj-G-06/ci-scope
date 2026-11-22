@@ -11,6 +11,7 @@ from classattr import dict_route, field_route
 from equiv import comment_or_blank, same_code, snippet
 from patch import Block, FilePatch, PatchError, apply, splice
 from structure import Structure
+from testmod import test_change
 
 _COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")  # PEP 263, lines 1-2
 LARGE_REGION = 300  # lines; above this, an insertion of real code is routed without a region parse
@@ -88,6 +89,12 @@ class PythonRoutes:
         if not pending:
             notes.append(f"{path}: comments or blank lines only")
             return 0
+        self._test_local, self._test_methods = False, None
+        if path.startswith("tests/"):
+            self._test_local, fresh, self._test_methods = test_change(before, after, pending)
+            if fresh and all(self.data.bit_of(f"{path}::{cls}::{name}") is None for cls, name in fresh):
+                notes.append(f"{path}: only new test methods ({', '.join(name for _cls, name in fresh)})")
+                return 0
         bits, before_lines = 0, before.split("\n")
         for group, first, last in _regions(pending, s):
             bits |= self._route_region(path, s, before, before_lines, after, group, first, last, notes)
@@ -178,9 +185,23 @@ class PythonRoutes:
     def _import_lines(self, path: str) -> set[int]:
         return set(self.data.import_lines.get(path, ()))
 
+    def _test_module_users(self, path: str, local: bool, notes: list[str], where: str) -> int:
+        """A test module's import-time change that only binds its own names reaches the tests whose
+        process imported it: its own tests and those of modules importing it."""
+        if not local or path not in self.data.module_users:
+            raise Everything(f"{where} import-time code in a test module")
+        users = self.data.users_of_module(path)
+        methods = getattr(self, "_test_methods", None)
+        if methods:  # only test methods' defs changed: their own tests and inherited copies
+            users &= self.data.named(methods)
+            notes.append(f"{where} test methods {', '.join(sorted(methods))}: {bin(users).count('1')}")
+            return users
+        notes.append(f"{where} test module users {bin(users).count('1')}")
+        return users
+
     def _import_users(self, path: str, s: Structure, line: int, notes: list[str]) -> int:
         if path.startswith("tests/"):
-            raise Everything(f"{path}:{line} import-time code in a test module")
+            return self._test_module_users(path, getattr(self, "_test_local", False), notes, f"{path}:{line}")
         qualname = s.class_name(line)
         users = self.data.users_of_class(path, qualname) if qualname else None
         if users:
@@ -221,7 +242,8 @@ class PythonRoutes:
 
     def _import_route_or_everything(self, path: str, notes: list[str]) -> int:
         if path.startswith("tests/"):
-            raise Everything(f"{path}: module-level change in a test module")
+            self._units += 1
+            return self._test_module_users(path, getattr(self, "_test_local", False), notes, f"{path}: module-level change;")
         self._units += 1
         users = self.data.users_of_module(path) | self.data.lazy_load_for(path)
         notes.append(f"{path}: module-level change -> module users {bin(users).count('1')}")
