@@ -145,7 +145,6 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             numbers, level = set(every), f"everything: internal error {error!r}"
         numbers &= every
-        numbers.discard(number_by_id.get('tests/test_parser.py::TestParser::test_max_nodes'))  # PROBE ONLY: what test_max_nodes costs on the practice board
         workers = schedule.split(numbers, durations)
         lines.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
         log(f"{commit}: {len(numbers)} tests, {len(workers)} workers, "
