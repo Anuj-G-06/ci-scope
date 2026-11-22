@@ -145,7 +145,6 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             numbers, level = set(every), f"everything: internal error {error!r}"
         numbers &= every
-        numbers.discard(number_by_id.get('tests/test_executor.py::TestExecutor::test_execute_tpcds'))  # PROBE ONLY: what test_execute_tpcds costs on the practice board
         workers = schedule.split(numbers, durations)
         lines.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
         log(f"{commit}: {len(numbers)} tests, {len(workers)} workers, "
