@@ -146,6 +146,8 @@ def main() -> int:
             numbers, level = set(every), f"everything: internal error {error!r}"
         numbers &= every
         workers = schedule.split(numbers, durations)
+        if schedule.cost(workers, durations) > 8000:  # PROBE ONLY: measures the expensive commits on the practice board
+            workers = []
         lines.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
         log(f"{commit}: {len(numbers)} tests, {len(workers)} workers, "
             f"{schedule.cost(workers, durations) / 1000:.3f} s ({level}) | {'; '.join(notes)[:300]}")
