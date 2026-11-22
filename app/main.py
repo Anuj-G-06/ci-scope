@@ -97,7 +97,6 @@ def main() -> int:
         patch_path = os.path.join(commits_dir, name)
         commit = name[: -len(".patch")]
         notes: list[str] = []
-        reason = None  # PROBE ONLY: why test_execute_tpcds stays, encoded in an extra worker below
         try:
             if router is None:
                 raise Everything("no maps")
@@ -119,9 +118,7 @@ def main() -> int:
                 exact, tree = tpc_check.plan(code, router.touched)
                 current = schedule.cost(schedule.split(numbers, durations), durations)
                 saving = current - schedule.cost(schedule.split(numbers - {tpcds_number}, durations), durations)
-                reason = "import" if any(not r for *_x, r in router.touched) else "runtime"
                 if tpc_check.worth(exact, tree, saving):
-                    reason = "ran"
                     root = workspace.apply(router.patched)
                     counts = f"{len(exact)} exact, {len(tree)} tree cases"
                     try:
@@ -140,9 +137,7 @@ def main() -> int:
                 found = tpc_check.fixture_cases(router.patched_fixtures[tpc.FIXTURE])
                 current = schedule.cost(schedule.split(numbers, durations), durations)
                 saving = current - schedule.cost(schedule.split(numbers - {tpcds_number}, durations), durations)
-                reason = "other"
                 if found is not None and tpc_check.fixture_worth(found[0], found[1], saving):
-                    reason = "ran"
                     cases, changed = found
                     root = workspace.apply({})
                     if root is not None and tpc_check.passes(root, changed, set(), log, cases=cases):
@@ -168,14 +163,6 @@ def main() -> int:
             numbers, level = set(every), f"everything: internal error {error!r}"
         numbers &= every
         workers = schedule.split(numbers, durations)
-        if tpcds_number in numbers:  # PROBE ONLY: the busiest worker grows by a load (ms) that names the reason
-            if reason is None and router is not None and any(
-                p.startswith("tests/") and not p.startswith("tests/fixtures/") for p in getattr(router, "behavioral_files", ())
-            ):
-                reason = "tests"
-            code = {"ran": 1, "import": 4, "runtime": 16, "tests": 64}.get(reason, 256)
-            spare = [n for n in sorted(durations) if durations[n] == 1 and n not in numbers][:code]
-            max(workers, key=lambda w: sum(durations[n] for n in w)).extend(spare)  # cost rises by exactly code ms
         lines.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
         log(f"{commit}: {len(numbers)} tests, {len(workers)} workers, "
             f"{schedule.cost(workers, durations) / 1000:.3f} s ({level}) | {'; '.join(notes)[:300]}")
