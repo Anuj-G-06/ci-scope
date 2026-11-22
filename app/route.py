@@ -49,6 +49,7 @@ class Router(PythonRoutes):
         self.behavioral_files: set[str] = set()  # files whose change can alter behavior
         self.touched: list[tuple[str, int, int, bool]] = []  # (path, first, last, runtime-only) per changed line
         self.patched: dict[str, str] = {}  # python path -> patched text
+        self.patched_fixtures: dict[str, str] = {}  # TPC fixture path -> patched text (the TPC-DS check reads it)
         bits = 0
         for file_patch in files:
             before_units = self._units
@@ -187,6 +188,10 @@ class Router(PythonRoutes):
                 found = tpc_fixture_tests(fp.path, self.data.source(fp.path), fp.hunks, readers, self.data.bit_of, notes)
             if found is not None:
                 self._units += 1 if found else 0
+                try:
+                    self.patched_fixtures[fp.path] = apply(self.data.source(fp.path), fp.hunks)[0]
+                except PatchError:
+                    pass
                 return found
         if fp.path.endswith(".sql"):
             changed = [line for hunk in fp.hunks for line in hunk.lines if line[:1] in "+-"]

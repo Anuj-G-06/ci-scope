@@ -129,6 +129,22 @@ def main() -> int:
                             notes.append(f"tpc check: kept test_execute_tpcds ({counts})")
                     finally:
                         workspace.restore()
+            elif (
+                tpc_check is not None and tpcds_number in numbers and workspace is not None
+                and router.behavioral_files == {tpc.FIXTURE} and tpc.FIXTURE in router.patched_fixtures
+            ):
+                # Only tpc-ds.sql changed: run the cases whose query or meta changed, as the test would.
+                found = tpc_check.fixture_cases(router.patched_fixtures[tpc.FIXTURE])
+                current = schedule.cost(schedule.split(numbers, durations), durations)
+                saving = current - schedule.cost(schedule.split(numbers - {tpcds_number}, durations), durations)
+                if found is not None and tpc_check.fixture_worth(found[0], found[1], saving):
+                    cases, changed = found
+                    root = workspace.apply({})
+                    if root is not None and tpc_check.passes(root, changed, set(), log, cases=cases):
+                        numbers.discard(tpcds_number)
+                        notes.append(f"tpc check: {len(changed)} changed fixture cases pass, dropped test_execute_tpcds")
+                    else:
+                        notes.append(f"tpc check: kept test_execute_tpcds ({len(changed)} changed fixture cases)")
             if (
                 max_nodes is not None and max_nodes_number in numbers and workspace is not None
                 and applied and not reads_any(data, other, maxnodes.TEST)

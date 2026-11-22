@@ -26,6 +26,7 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+FIXTURE = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
 # The test's class setup also loads tables through Table: a change there is outside any case.
 NOT_ELIGIBLE = {"sqlglot/executor/table.py"}
 CPU_FACTOR = 1.3  # board CPU has tracked ours at ~1.1-1.3x (v7-v10 board runs)
@@ -33,6 +34,7 @@ CPU_FACTOR = 1.3  # board CPU has tracked ours at ~1.1-1.3x (v7-v10 board runs)
 # (parse, pickle, optimize, fingerprint, DuckDB SQL); per parsed-only case; pandas + expected results;
 # per executed case.
 BASE_MS, TREE_MS, PARSED_MS, PANDAS_MS, EXECUTED_MS = 300, 40, 3, 700, 170
+DUCKDB_MS, LIVE_MS = 300, 50  # DuckDB import and table views; one live reference query
 PASS_RATE = 0.6  # how often a selected TPC-DS test passed on our labeled commits (22 of 37)
 BUDGET_SECONDS = float(os.environ.get("SHRAPNEL_TPC_BUDGET", "60"))  # total wall time for all checks in a run
 
@@ -84,6 +86,7 @@ class TPC:
         with open(os.path.join(root, "cases.json"), encoding="utf-8") as file:
             cases = json.load(file)["cases"]
         self.count = len(cases)
+        self.cases = cases
         self.executed = {i for i, c in enumerate(cases) if c["execute"]}
 
         def read(name):
@@ -150,6 +153,35 @@ class TPC:
         executed = cases & self.executed
         return (cases - self.executed) | (post & executed), executed - post
 
+    def fixture_cases(self, text: str):
+        """(cases, changed) for a patched tpc-ds.sql: the cases the test's loader returns, and those whose
+        (meta, sql) differ from the pinned case at the same position (only they can behave differently on
+        unchanged code). None when the loader fails: then the test's setUpClass fails."""
+        from fixtures import fixture_pairs
+
+        self._load()
+        try:
+            pairs = fixture_pairs(text)
+        except Exception:  # noqa: BLE001
+            return None
+        cases, changed = [], set()
+        for i, (meta, sql, _expected) in enumerate(pairs):
+            case = {"sql": sql, "execute": bool(meta.get("execute"))}  # mp_execute's own test
+            pinned = self.cases[i] if i < len(self.cases) else None
+            if pinned is not None and (pinned["sql"], pinned["execute"]) == (case["sql"], case["execute"]):
+                case["duckdb"] = pinned["duckdb"]
+            else:
+                changed.add(i)
+            cases.append(case)
+        return cases, changed
+
+    def fixture_worth(self, cases, changed: set[int], saving_ms: int) -> bool:
+        executed = sum(1 for i in changed if cases[i]["execute"])
+        cost = BASE_MS + PARSED_MS * (len(changed) - executed)
+        if executed:
+            cost += PANDAS_MS + DUCKDB_MS + (EXECUTED_MS + LIVE_MS) * executed
+        return PASS_RATE * saving_ms > CPU_FACTOR * cost
+
     def _cost(self, exact: set[int], tree: set[int]) -> int:
         executed = len(exact & self.executed)
         cost = BASE_MS + TREE_MS * len(tree) + PARSED_MS * (len(exact) - executed)
@@ -169,9 +201,14 @@ class TPC:
             spare -= PANDAS_MS
         return max(0, min(len(tree), int(spare // EXECUTED_MS)))
 
-    def passes(self, workspace: str, exact: set[int], tree: set[int], log, fallbacks: int = 6) -> bool:
+    def passes(self, workspace: str, exact: set[int], tree: set[int], log, fallbacks: int = 6, cases=None) -> bool:
         if not exact and not tree:
             return True
+        cases_file = ""
+        if cases is not None:
+            handle, cases_file = tempfile.mkstemp(prefix="shrapnel-cases-", suffix=".json")
+            with os.fdopen(handle, "w", encoding="utf-8") as file:
+                json.dump(cases, file)
         remaining = BUDGET_SECONDS - self.spent
         if remaining < 10:
             log("tpc check skipped: time budget used")
@@ -180,7 +217,7 @@ class TPC:
         try:
             result = subprocess.run(
                 [sys.executable, "-I", "-B", os.path.join(HERE, "tpc_exact.py"), workspace, self.data_dir,
-                 ",".join(str(c) for c in sorted(exact)), ",".join(str(c) for c in sorted(tree)), str(fallbacks)],
+                 ",".join(str(c) for c in sorted(exact)), ",".join(str(c) for c in sorted(tree)), str(fallbacks), cases_file],
                 env={"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp")},
                 capture_output=True, text=True, timeout=remaining,
             )
@@ -190,6 +227,8 @@ class TPC:
             return False
         finally:
             self.spent += time.monotonic() - started
+            if cases_file:
+                os.unlink(cases_file)
         if verdict.get("verdict") != "pass":
             log(f"tpc check: {verdict.get('verdict')} at case {verdict.get('case')} ({verdict.get('why', '')[:120]})")
         return verdict.get("verdict") == "pass"

@@ -1,19 +1,20 @@
 """Runtime check of test_execute_tpcds on the cases a patch can reach, run on the patched sqlglot.
 
-    python -I -B tpc_exact.py <dir holding the sqlglot package> <data_dir> <exact cases> [<tree cases> [<max fallbacks>]]
+    python -I -B tpc_exact.py <dir holding the sqlglot package> <data_dir> <exact cases> [<tree cases> [<max fallbacks> [<cases.json>]]]
     python -I -B tpc_exact.py <dir holding the pinned sqlglot> <data_dir> --trees > trees.json
 
 Exact cases do what the test does: parse in the test process, pickle the expression to a worker and
 unpickle it, find its tables, execute it on the real TPC-DS tables, and compare with the DuckDB result
-using the test's own assert_frame_equal call. The DuckDB result was computed from the pinned commit, so
-it is only valid while the patch leaves the case's DuckDB SQL unchanged; otherwise the verdict is
-"unknown" and the caller keeps the test.
+using the test's own assert_frame_equal call. The pinned DuckDB result stands while the patch leaves the
+case's DuckDB SQL unchanged; otherwise DuckDB (the labeling version) runs the new SQL over views of the
+same tables, exactly as the test's setUpClass and cached_execute do. A cases.json argument replaces the
+pinned case list (the cases a patched tpc-ds.sql loads).
 
 Tree cases (patches that change only runtime lines the planner and executor do not run for that case)
 first check that the case's DuckDB SQL is unchanged, then parse, pickle and run the real execute() up to
 the planner, and fingerprint the optimized tree it would plan: every node, argument, type, comment, meta
 value and cached hash, plus its parent links and any shared nodes. A case whose fingerprint equals the
-pinned one is cleared; any other goes to the exact check.
+pinned one is cleared; any other, and any whose DuckDB SQL changed, goes to the exact check.
 
 Prints {"verdict": "pass" | "fail" | "unknown", "case": i, "why": ...}.
 """
@@ -99,7 +100,7 @@ def fingerprint(root, exp) -> str:
     return hashlib.sha256("\x02".join(out).encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", max_fallbacks: str = "") -> None:
+def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", max_fallbacks: str = "", cases_file: str = "") -> None:
     sys.path.insert(0, package_dir)
     import logging
 
@@ -113,18 +114,37 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", ma
     with open(os.path.join(root, "cases.json"), encoding="utf-8") as file:
         spec = json.load(file)
     schema, cases = spec["schema"], spec["cases"]
+    if cases_file:  # the cases a patched tpc-ds.sql loads: none has a pinned DuckDB result
+        with open(cases_file, encoding="utf-8") as file:
+            cases = json.load(file)
 
     def result(verdict, case=None, why=""):
         sys.stdout.write(json.dumps({"verdict": verdict, "case": case, "why": why[:300]}))
 
-    def duckdb_changed(i):
-        """(verdict, why) when the test's DuckDB side differs from the pinned one, so the pinned expected
-        result no longer applies; None when it is the same SQL."""
-        try:
-            sql = transpile(cases[i]["sql"], write="duckdb")[0]
-        except Exception as error:  # noqa: BLE001
-            return "fail", f"duckdb transpile {type(error).__name__}"
-        return None if sql == cases[i]["duckdb"] else ("unknown", "the DuckDB SQL changed, so the pinned expected result does not apply")
+    def duckdb_sql(i):
+        """The test's DuckDB SQL for case i, and whether it is the pinned one (so is its pinned result)."""
+        sql = transpile(cases[i]["sql"], write="duckdb")[0]
+        return sql, sql == cases[i].get("duckdb")
+
+    connection = []
+
+    def live(sql):
+        """The test's cached_execute: DuckDB over views of the real tables, as setUpClass creates them."""
+        if not connection:
+            import duckdb
+
+            conn = duckdb.connect()
+            for table, columns in schema.items():
+                file_name = os.path.join(root, "tables", f"{table}.csv.gz")
+                conn.execute(
+                    f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+                )
+            connection.append(conn)
+        return connection[0].execute(sql).fetchdf()
 
     class Planned(Exception):
         pass
@@ -159,12 +179,16 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", ma
     if tree_indices:
         with open(os.path.join(root, "trees.json"), encoding="utf-8") as file:
             pinned = json.load(file)
-        for i in tree_indices:  # cheap, and it settles most patches that change the result early
-            changed = duckdb_changed(i)
-            if changed:
-                return result(changed[0], i, changed[1])
         fallbacks = []
+        for i in tree_indices:  # a changed DuckDB SQL needs the live comparison: the exact check
+            try:
+                if not duckdb_sql(i)[1]:
+                    fallbacks.append(i)
+            except Exception as error:  # noqa: BLE001
+                return result("fail", i, f"duckdb transpile {type(error).__name__}")
         for i in tree_indices:
+            if i in fallbacks:
+                continue
             try:
                 same = optimized_fingerprint(i) == pinned.get(str(i))
             except Exception:  # noqa: BLE001 - the exact check will see the error, if it is real
@@ -187,9 +211,10 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", ma
             return result("fail", i, f"parse/pickle {type(error).__name__}: {error}")
         if not case["execute"]:
             continue  # mp_execute returns None: nothing else runs for this case
-        changed = duckdb_changed(i)
-        if changed:
-            return result(changed[0], i, changed[1])
+        try:
+            sql, pinned_sql = duckdb_sql(i)
+        except Exception as error:  # noqa: BLE001
+            return result("fail", i, f"duckdb transpile {type(error).__name__}")
         if expected is None:
             import numpy as np
             import pandas as pd
@@ -206,7 +231,7 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", ma
         except Exception as error:  # noqa: BLE001
             return result("fail", i, f"execute {type(error).__name__}: {error}")
         try:
-            a = expected[str(i)] if str(i) in expected else expected[i]
+            a = (expected[str(i)] if str(i) in expected else expected[i]) if pinned_sql else live(sql)
             b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns)
             assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
         except AssertionError as error:
@@ -217,4 +242,4 @@ def main(package_dir: str, data_dir: str, wanted: str, tree_wanted: str = "", ma
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:6])
+    main(*sys.argv[1:7])
