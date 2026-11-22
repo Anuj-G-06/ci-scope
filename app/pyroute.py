@@ -64,6 +64,29 @@ def _lines(blocks: list[Block], s: Structure) -> list[int]:
     return [line for block in blocks for line in block.lines if 1 <= line <= s.lines]
 
 
+def _lambda_bodies_only(old, new) -> bool:
+    """Every difference lies inside lambda bodies (same parameters and defaults): at import the change only
+    swaps code objects, which run, and so show up in line coverage, when called."""
+    found = []
+
+    def walk(a, b) -> bool:
+        if isinstance(a, ast.Lambda) and isinstance(b, ast.Lambda):
+            if not infect.same(a.args, b.args):
+                return False
+            if not infect.same(a.body, b.body):
+                found.append(a)
+            return True
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.AST):
+            return all(walk(getattr(a, f, None), getattr(b, f, None)) for f in a._fields)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(walk(x, y) for x, y in zip(a, b))
+        return a == b
+
+    return walk(old, new) and bool(found)
+
+
 class PythonRoutes:
     """Mixed into route.Router, which provides data, notes plumbing and the per-patch state."""
 
@@ -137,9 +160,16 @@ class PythonRoutes:
             for route in (dict_route, field_route):
                 found = route(self.data, path, s, first, last, old_tree, new_tree, notes)
                 if found is not None:
-                    self.touched.append((path, first, last, False))  # runs at import: the TPC check must know
+                    if _lambda_bodies_only(old_tree, new_tree):  # runs when called: the changed lines say when
+                        self.touched.extend((path, line, line, True) for line in lines)
+                    else:
+                        self.touched.append((path, first, last, False))  # runs at import: the TPC check must know
                     return found
-        bits = self._route_lines(path, s, lines, notes)
+        self._deferred = _lambda_bodies_only(old_tree, new_tree)
+        try:
+            bits = self._route_lines(path, s, lines, notes)
+        finally:
+            self._deferred = False
         imported = self._import_lines(path)
         if self.data.has_values(path) and all(s.kind(line) == "runtime" and line not in imported for line in lines):
             pairs = infect.changed_comparisons(old_tree, new_tree)
@@ -159,6 +189,8 @@ class PythonRoutes:
         if kind == "runtime" and not imported:
             first, last = s.coverage_region(line)
             self.touched.append((path, first, last, True))
+        elif kind == "both" and getattr(self, "_deferred", False):
+            self.touched.append((path, line, line, True))  # only lambda bodies changed: they run when called
         else:
             self.touched.append((path, line, line, False))  # runs at import: reaches everything
         bits = 0
